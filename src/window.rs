@@ -25,9 +25,9 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCES
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetDesktopWindow, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
-    WS_CHILD, WS_EX_TOOLWINDOW,
+    EnumWindows, FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetForegroundWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_CHILD,
+    WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, HSTRING, Owned};
 
@@ -253,7 +253,7 @@ impl Window {
         let window_height = window_rect.bottom - window_rect.top;
         let dpi = unsafe { GetDpiForWindow(self.window) };
         let client_height = (client_rect.bottom - client_rect.top) * dpi as i32 / 96;
-        let actual_title_height = (window_height - client_height) as i32;
+        let actual_title_height = (window_height - client_height).max(0);
 
         Ok(actual_title_height as u32)
     }
@@ -307,19 +307,14 @@ impl Window {
     ///
     /// # Errors
     ///
-    /// - [`Error::WindowsError`] when `EnumChildWindows` fails
+    /// - [`Error::WindowsError`] when `EnumWindows` fails
     #[inline]
     pub fn enumerate() -> Result<Vec<Self>, Error> {
         let mut windows: Vec<Self> = Vec::new();
 
         unsafe {
-            EnumChildWindows(
-                Some(GetDesktopWindow()),
-                Some(Self::enum_windows_callback),
-                LPARAM(ptr::addr_of_mut!(windows) as isize),
-            )
-            .ok()?;
-        };
+            EnumWindows(Some(Self::enum_windows_callback), LPARAM(ptr::addr_of_mut!(windows) as isize))?;
+        }
 
         Ok(windows)
     }

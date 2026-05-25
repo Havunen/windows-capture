@@ -1,17 +1,16 @@
 use std::fs::{self};
 use std::path::Path;
-use std::{io, ptr, slice};
+use std::{io, ptr};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use windows::Foundation::TimeSpan;
 use windows::Graphics::Capture::Direct3D11CaptureFrame;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DSurface;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_READ_WRITE, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
+use crate::d3d11::{MappedStagingTexture, StagingTexture};
 use crate::encoder::{self, ImageEncoder, ImageEncoderError, ImageEncoderPixelFormat, ImageFormat};
 use crate::settings::ColorFormat;
 
@@ -27,6 +26,9 @@ pub enum Error {
     /// The current [`ColorFormat`] cannot be saved as an image.
     #[error("This color format is not supported for saving as an image")]
     UnsupportedFormat,
+    /// Direct3D staging/mapping failed.
+    #[error("DirectX error: {0}")]
+    DirectXError(#[from] crate::d3d11::Error),
     /// Image encoding failed.
     ///
     /// Wraps [`crate::encoder::ImageEncoderError`].
@@ -169,55 +171,16 @@ impl<'a> Frame<'a> {
     /// Gets the frame buffer.
     #[inline]
     pub fn buffer(&'_ mut self) -> Result<FrameBuffer<'_>, Error> {
-        // Texture Settings
-        let texture_desc = D3D11_TEXTURE2D_DESC {
-            Width: self.width(),
-            Height: self.height(),
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT(self.color_format as i32),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32 | D3D11_CPU_ACCESS_WRITE.0 as u32,
-            MiscFlags: 0,
-        };
+        let staging = StagingTexture::new(self.d3d_device, self.width(), self.height(), self.desc.Format)?;
 
-        // Create a texture that the CPU can read
-        let mut texture = None;
+        // Copy the GPU texture into a CPU-readable staging texture before mapping it.
         unsafe {
-            self.d3d_device.CreateTexture2D(&texture_desc, None, Some(&mut texture))?;
-        };
+            self.context.CopyResource(staging.texture(), &self.frame_texture);
+        }
 
-        let texture = texture.unwrap();
+        let mapped_texture = MappedStagingTexture::map_owned(self.context, staging)?;
 
-        // Copy the real texture to the staging texture
-        unsafe {
-            self.context.CopyResource(&texture, &self.frame_texture);
-        };
-
-        // Map the texture to enable CPU access
-        let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context.Map(&texture, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped_resource))?;
-        };
-
-        // Get a slice of the mapped resource data
-        let mapped_frame_data = unsafe {
-            slice::from_raw_parts_mut(mapped_resource.pData.cast(), (self.height() * mapped_resource.RowPitch) as usize)
-        };
-
-        // Create a frame buffer from the slice
-        let frame_buffer = FrameBuffer::new(
-            mapped_frame_data,
-            self.width(),
-            self.height(),
-            mapped_resource.RowPitch,
-            mapped_resource.DepthPitch,
-            self.color_format,
-        );
-
-        Ok(frame_buffer)
+        Ok(FrameBuffer::from_mapped(mapped_texture, self.width(), self.height(), self.color_format))
     }
 
     /// Gets a cropped frame buffer.
@@ -236,60 +199,28 @@ impl<'a> Frame<'a> {
         let texture_width = end_x - start_x;
         let texture_height = end_y - start_y;
 
-        // Texture Settings
-        let texture_desc = D3D11_TEXTURE2D_DESC {
-            Width: texture_width,
-            Height: texture_height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT(self.color_format as i32),
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32 | D3D11_CPU_ACCESS_WRITE.0 as u32,
-            MiscFlags: 0,
-        };
-
-        // Create a texture that the CPU can read
-        let mut texture = None;
-        unsafe {
-            self.d3d_device.CreateTexture2D(&texture_desc, None, Some(&mut texture))?;
-        };
-        let texture = texture.unwrap();
+        let staging = StagingTexture::new(self.d3d_device, texture_width, texture_height, self.desc.Format)?;
 
         // Box settings
         let resource_box = D3D11_BOX { left: start_x, top: start_y, front: 0, right: end_x, bottom: end_y, back: 1 };
 
-        // Copy the real texture to the staging texture
+        // Copy the requested sub-rectangle into a CPU-readable staging texture.
         unsafe {
-            self.context.CopySubresourceRegion(&texture, 0, 0, 0, 0, &self.frame_texture, 0, Some(&resource_box));
-        };
+            self.context.CopySubresourceRegion(
+                staging.texture(),
+                0,
+                0,
+                0,
+                0,
+                &self.frame_texture,
+                0,
+                Some(&resource_box),
+            );
+        }
 
-        // Map the texture to enable CPU access
-        let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context.Map(&texture, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped_resource))?;
-        };
+        let mapped_texture = MappedStagingTexture::map_owned(self.context, staging)?;
 
-        // Get a slice of the mapped resource data
-        let mapped_frame_data = unsafe {
-            slice::from_raw_parts_mut(
-                mapped_resource.pData.cast(),
-                (texture_height * mapped_resource.RowPitch) as usize,
-            )
-        };
-
-        // Create a frame buffer from the slice
-        let frame_buffer = FrameBuffer::new(
-            mapped_frame_data,
-            texture_width,
-            texture_height,
-            mapped_resource.RowPitch,
-            mapped_resource.DepthPitch,
-            self.color_format,
-        );
-
-        Ok(frame_buffer)
+        Ok(FrameBuffer::from_mapped(mapped_texture, texture_width, texture_height, self.color_format))
     }
 
     /// Gets the frame buffer without the title bar.
@@ -317,6 +248,27 @@ impl<'a> Frame<'a> {
     }
 }
 
+enum FrameBufferBacking<'a> {
+    Borrowed(&'a mut [u8]),
+    Mapped(MappedStagingTexture<'a>),
+}
+
+impl FrameBufferBacking<'_> {
+    const fn as_slice(&self, height: u32) -> &[u8] {
+        match self {
+            Self::Borrowed(buffer) => buffer,
+            Self::Mapped(texture) => texture.as_slice(height),
+        }
+    }
+
+    const fn as_mut_slice(&mut self, height: u32) -> &mut [u8] {
+        match self {
+            Self::Borrowed(buffer) => buffer,
+            Self::Mapped(texture) => texture.as_mut_slice(height),
+        }
+    }
+}
+
 /// Represents a frame buffer containing pixel data.
 ///
 /// # Example
@@ -326,7 +278,7 @@ impl<'a> Frame<'a> {
 /// buffer.save_as_image("screenshot.png", ImageFormat::Png)?;
 /// ```
 pub struct FrameBuffer<'a> {
-    raw_buffer: &'a mut [u8],
+    backing: FrameBufferBacking<'a>,
     width: u32,
     height: u32,
     row_pitch: u32,
@@ -346,7 +298,26 @@ impl<'a> FrameBuffer<'a> {
         depth_pitch: u32,
         color_format: ColorFormat,
     ) -> Self {
-        Self { raw_buffer, width, height, row_pitch, depth_pitch, color_format }
+        Self { backing: FrameBufferBacking::Borrowed(raw_buffer), width, height, row_pitch, depth_pitch, color_format }
+    }
+
+    const fn from_mapped(
+        mapped_texture: MappedStagingTexture<'a>,
+        width: u32,
+        height: u32,
+        color_format: ColorFormat,
+    ) -> Self {
+        let row_pitch = mapped_texture.row_pitch();
+        let depth_pitch = mapped_texture.depth_pitch();
+
+        Self {
+            backing: FrameBufferBacking::Mapped(mapped_texture),
+            width,
+            height,
+            row_pitch,
+            depth_pitch,
+            color_format,
+        }
     }
 
     /// Gets the width of the frame buffer.
@@ -388,47 +359,45 @@ impl<'a> FrameBuffer<'a> {
     #[inline]
     #[must_use]
     pub const fn has_padding(&self) -> bool {
-        self.width * 4 != self.row_pitch
+        self.width * self.bytes_per_pixel() != self.row_pitch
     }
 
     /// Gets the raw pixel data, which may include padding.
     #[inline]
     #[must_use]
     pub const fn as_raw_buffer(&mut self) -> &mut [u8] {
-        self.raw_buffer
+        self.backing.as_mut_slice(self.height)
     }
 
     /// Gets the pixel data without padding.
     #[inline]
     #[must_use]
     pub fn as_nopadding_buffer<'b>(&'b self, buffer: &'b mut Vec<u8>) -> &'b [u8] {
+        let raw_buffer = self.backing.as_slice(self.height);
+
         if !self.has_padding() {
-            return self.raw_buffer;
+            return raw_buffer;
         }
 
-        let multiplier = match self.color_format {
-            ColorFormat::Rgba16F => 8,
-            ColorFormat::Rgba8 => 4,
-            ColorFormat::Bgra8 => 4,
-        };
-
-        let frame_size = (self.width * self.height * multiplier) as usize;
-        if buffer.capacity() < frame_size {
+        let width = self.width;
+        let height = self.height;
+        let row_pitch = self.row_pitch;
+        let multiplier = self.bytes_per_pixel();
+        let frame_size = (width * height * multiplier) as usize;
+        if buffer.len() < frame_size {
             buffer.resize(frame_size, 0);
         }
 
-        let width_size = (self.width * multiplier) as usize;
-        let buffer_address = buffer.as_mut_ptr() as isize;
-        (0..self.height).into_par_iter().for_each(|y| {
-            let index = (y * self.row_pitch) as usize;
-            let ptr = buffer_address as *mut u8;
+        let width_size = (width * multiplier) as usize;
+        let buffer_address = buffer.as_mut_ptr() as usize;
+        let raw_buffer_address = raw_buffer.as_ptr() as usize;
+        (0..height).into_par_iter().for_each(|y| {
+            let index = (y * row_pitch) as usize;
+            let src = raw_buffer_address as *const u8;
+            let dst = buffer_address as *mut u8;
 
             unsafe {
-                ptr::copy_nonoverlapping(
-                    self.raw_buffer.as_ptr().add(index),
-                    ptr.add(y as usize * width_size),
-                    width_size,
-                );
+                ptr::copy_nonoverlapping(src.add(index), dst.add(y as usize * width_size), width_size);
             }
         });
 
@@ -454,5 +423,14 @@ impl<'a> FrameBuffer<'a> {
         fs::write(path, bytes)?;
 
         Ok(())
+    }
+
+    #[inline]
+    #[must_use]
+    const fn bytes_per_pixel(&self) -> u32 {
+        match self.color_format {
+            ColorFormat::Rgba16F => 8,
+            ColorFormat::Rgba8 | ColorFormat::Bgra8 => 4,
+        }
     }
 }

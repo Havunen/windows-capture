@@ -5,7 +5,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
 use parking_lot::Mutex;
-use windows::Win32::Foundation::{HANDLE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{ERROR_INVALID_THREAD_ID, HANDLE, LPARAM, WPARAM};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
 use windows::Win32::System::Threading::{GetCurrentThreadId, GetThreadId};
 use windows::Win32::System::WinRT::{
@@ -22,6 +22,41 @@ use crate::frame::Frame;
 use crate::graphics_capture_api::{self, GraphicsCaptureApi, InternalCaptureControl};
 use crate::settings::{GraphicsCaptureItemType, Settings};
 use crate::winrt::WinRT;
+
+const fn dispatcher_queue_options() -> DispatcherQueueOptions {
+    DispatcherQueueOptions {
+        dwSize: mem::size_of::<DispatcherQueueOptions>() as u32,
+        threadType: DQTYPE_THREAD_CURRENT,
+        apartmentType: DQTAT_COM_NONE,
+    }
+}
+
+fn run_message_loop<E>() -> Result<(), GraphicsCaptureApiError<E>> {
+    let mut message = MSG::default();
+
+    loop {
+        match unsafe { GetMessageW(&mut message, None, 0, 0).0 } {
+            -1 => return Err(GraphicsCaptureApiError::FailedToRunMessageLoop),
+            0 => return Ok(()),
+            _ => unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            },
+        }
+    }
+}
+
+fn join_capture_thread<E>(
+    thread_handle: JoinHandle<Result<(), GraphicsCaptureApiError<E>>>,
+) -> Result<(), CaptureControlError<E>> {
+    match thread_handle.join() {
+        Ok(result) => {
+            result?;
+            Ok(())
+        }
+        Err(_) => Err(CaptureControlError::FailedToJoinThread),
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 /// Errors that can occur while controlling a running capture session via [`CaptureControl`].
@@ -113,12 +148,7 @@ impl<T: GraphicsCaptureApiHandler + Send + 'static, E> CaptureControl<T, E> {
     #[inline]
     pub fn wait(mut self) -> Result<(), CaptureControlError<E>> {
         if let Some(thread_handle) = self.thread_handle.take() {
-            match thread_handle.join() {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(CaptureControlError::FailedToJoinThread);
-                }
-            }
+            join_capture_thread(thread_handle)?;
         } else {
             return Err(CaptureControlError::ThreadHandleIsTaken);
         }
@@ -146,27 +176,33 @@ impl<T: GraphicsCaptureApiHandler + Send + 'static, E> CaptureControl<T, E> {
             let handle = HANDLE(handle);
             let thread_id = unsafe { GetThreadId(handle) };
 
+            if thread_id == 0 {
+                if thread_handle.is_finished() {
+                    join_capture_thread(thread_handle)?;
+                    return Ok(());
+                }
+
+                return Err(CaptureControlError::FailedToPostThreadMessage);
+            }
+
             loop {
                 match unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM::default(), LPARAM::default()) } {
                     Ok(()) => break,
-                    Err(e) => {
+                    Err(error) => {
                         if thread_handle.is_finished() {
                             break;
                         }
 
-                        if e.code().0 != -2_147_023_452 {
-                            Err(e).map_err(|_| CaptureControlError::FailedToPostThreadMessage)?;
+                        if error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_THREAD_ID.0) {
+                            return Err(CaptureControlError::FailedToPostThreadMessage);
                         }
+
+                        thread::yield_now();
                     }
                 }
             }
 
-            match thread_handle.join() {
-                Ok(result) => result?,
-                Err(_) => {
-                    return Err(CaptureControlError::FailedToJoinThread);
-                }
-            }
+            join_capture_thread(thread_handle)?;
         } else {
             return Err(CaptureControlError::ThreadHandleIsTaken);
         }
@@ -195,6 +231,12 @@ pub enum GraphicsCaptureApiError<E> {
     /// Registering the dispatcher queue completion handler failed.
     #[error("Failed to set dispatcher queue completed handler")]
     FailedToSetDispatcherQueueCompletedHandler,
+    /// The Windows message loop for the capture thread failed.
+    #[error("Failed to run the capture thread message loop")]
+    FailedToRunMessageLoop,
+    /// The free-threaded capture worker exited before publishing its control handles.
+    #[error("Failed to initialize the capture thread")]
+    FailedToStartCaptureThread,
     /// The provided item could not be converted into a `GraphicsCaptureItem`.
     ///
     /// This happens when
@@ -252,16 +294,11 @@ pub trait GraphicsCaptureApiHandler: Sized {
         <Self as GraphicsCaptureApiHandler>::Flags: Send,
     {
         // Initialize WinRT
-        let _winrt = WinRT::new();
+        let _winrt = WinRT::new().map_err(|_| GraphicsCaptureApiError::FailedToInitWinRT)?;
 
         // Create a dispatcher queue for the current thread
-        let options = DispatcherQueueOptions {
-            dwSize: u32::try_from(mem::size_of::<DispatcherQueueOptions>()).unwrap(),
-            threadType: DQTYPE_THREAD_CURRENT,
-            apartmentType: DQTAT_COM_NONE,
-        };
         let controller = unsafe {
-            CreateDispatcherQueueController(options)
+            CreateDispatcherQueueController(dispatcher_queue_options())
                 .map_err(|_| GraphicsCaptureApiError::FailedToCreateDispatcherQueueController)?
         };
 
@@ -297,13 +334,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
         capture.start_capture().map_err(GraphicsCaptureApiError::GraphicsCaptureApiError)?;
 
         // Message loop
-        let mut message = MSG::default();
-        unsafe {
-            while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-        }
+        run_message_loop()?;
 
         // Shut down dispatcher queue
         let async_action =
@@ -317,13 +348,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
             .map_err(|_| GraphicsCaptureApiError::FailedToSetDispatcherQueueCompletedHandler)?;
 
         // Final message loop
-        let mut message = MSG::default();
-        unsafe {
-            while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-        }
+        run_message_loop()?;
 
         // Stop capture
         capture.stop_capture();
@@ -351,16 +376,11 @@ pub trait GraphicsCaptureApiHandler: Sized {
 
         let thread_handle = thread::spawn(move || -> Result<(), GraphicsCaptureApiError<Self::Error>> {
             // Initialize WinRT
-            let _winrt = WinRT::new();
+            let _winrt = WinRT::new().map_err(|_| GraphicsCaptureApiError::FailedToInitWinRT)?;
 
             // Create a dispatcher queue for the current thread
-            let options = DispatcherQueueOptions {
-                dwSize: u32::try_from(mem::size_of::<DispatcherQueueOptions>()).unwrap(),
-                threadType: DQTYPE_THREAD_CURRENT,
-                apartmentType: DQTAT_COM_NONE,
-            };
             let controller = unsafe {
-                CreateDispatcherQueueController(options)
+                CreateDispatcherQueueController(dispatcher_queue_options())
                     .map_err(|_| GraphicsCaptureApiError::FailedToCreateDispatcherQueueController)?
             };
 
@@ -401,19 +421,13 @@ pub trait GraphicsCaptureApiHandler: Sized {
 
             // Send halt handle
             let halt_handle = capture.halt_handle();
-            halt_sender.send(halt_handle).unwrap();
+            halt_sender.send(halt_handle).map_err(|_| GraphicsCaptureApiError::FailedToStartCaptureThread)?;
 
             // Send callback
-            callback_sender.send(callback).unwrap();
+            callback_sender.send(callback).map_err(|_| GraphicsCaptureApiError::FailedToStartCaptureThread)?;
 
             // Message loop
-            let mut message = MSG::default();
-            unsafe {
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
+            run_message_loop()?;
 
             // Shutdown dispatcher queue
             let async_action = controller
@@ -428,13 +442,7 @@ pub trait GraphicsCaptureApiHandler: Sized {
                 .map_err(|_| GraphicsCaptureApiError::FailedToSetDispatcherQueueCompletedHandler)?;
 
             // Final message loop
-            let mut message = MSG::default();
-            unsafe {
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
+            run_message_loop()?;
 
             // Stop capture
             capture.stop_capture();
@@ -450,7 +458,8 @@ pub trait GraphicsCaptureApiHandler: Sized {
 
         let Ok(halt_handle) = halt_receiver.recv() else {
             match thread_handle.join() {
-                Ok(result) => return Err(result.err().unwrap()),
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(())) => return Err(GraphicsCaptureApiError::FailedToStartCaptureThread),
                 Err(_) => {
                     return Err(GraphicsCaptureApiError::FailedToJoinThread);
                 }
@@ -459,7 +468,8 @@ pub trait GraphicsCaptureApiHandler: Sized {
 
         let Ok(callback) = callback_receiver.recv() else {
             match thread_handle.join() {
-                Ok(result) => return Err(result.err().unwrap()),
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(())) => return Err(GraphicsCaptureApiError::FailedToStartCaptureThread),
                 Err(_) => {
                     return Err(GraphicsCaptureApiError::FailedToJoinThread);
                 }

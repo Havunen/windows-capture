@@ -235,10 +235,10 @@ impl GraphicsCaptureApi {
                 }
 
                 // Get frame
-                let frame = frame
-                    .as_ref()
-                    .expect("FrameArrived parameter was None this should never happen.")
-                    .TryGetNextFrame()?;
+                let Some(frame_pool) = frame.as_ref() else {
+                    return Ok(());
+                };
+                let frame = frame_pool.TryGetNextFrame()?;
 
                 // Get frame content size
                 let frame_content_size = frame.ContentSize()?;
@@ -395,7 +395,9 @@ impl GraphicsCaptureApi {
             return Err(Error::AlreadyStarted);
         }
 
-        self.session.as_ref().unwrap().StartCapture()?;
+        if let Some(session) = &self.session {
+            session.StartCapture()?;
+        }
         self.active = true;
 
         Ok(())
@@ -404,26 +406,7 @@ impl GraphicsCaptureApi {
     /// Stops the capture session and cleans up resources.
     #[inline]
     pub fn stop_capture(mut self) {
-        if let Some(frame_pool) = self.frame_pool.take() {
-            frame_pool
-                .RemoveFrameArrived(self.frame_arrived_event_token)
-                .expect("Failed to remove Frame Arrived event handler");
-
-            frame_pool.Close().expect("Failed to Close Frame Pool");
-        }
-
-        if let Some(session) = self.session.take() {
-            session.Close().expect("Failed to Close Capture Session");
-        }
-
-        let item = match &self.item_with_details {
-            GraphicsCaptureItemType::Window((item, _)) => item,
-            GraphicsCaptureItemType::Monitor((item, _)) => item,
-            GraphicsCaptureItemType::Unknown((item, _)) => item,
-        };
-
-        item.RemoveClosed(self.capture_closed_event_token)
-            .expect("Failed to remove Capture Session Closed event handler");
+        self.cleanup();
     }
 
     /// Gets the halt handle.
@@ -488,10 +471,8 @@ impl GraphicsCaptureApi {
             &HSTRING::from("DirtyRegionMode"),
         )? && Self::is_supported()?)
     }
-}
 
-impl Drop for GraphicsCaptureApi {
-    fn drop(&mut self) {
+    fn cleanup(&mut self) {
         if let Some(frame_pool) = self.frame_pool.take() {
             let _ = frame_pool.RemoveFrameArrived(self.frame_arrived_event_token);
             let _ = frame_pool.Close();
@@ -508,5 +489,12 @@ impl Drop for GraphicsCaptureApi {
         };
 
         let _ = item.RemoveClosed(self.capture_closed_event_token);
+        self.active = false;
+    }
+}
+
+impl Drop for GraphicsCaptureApi {
+    fn drop(&mut self) {
+        self.cleanup();
     }
 }

@@ -27,27 +27,24 @@
 //! }
 //! ```
 use std::path::Path;
-use std::{fs, io, slice};
+use std::{fs, io};
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use windows::Win32::Foundation::E_ACCESSDENIED;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_MAP_READ_WRITE, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
-    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice4,
-    IDXGIOutput6, IDXGIOutputDuplication,
+    DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIDevice4, IDXGIOutput6, IDXGIOutputDuplication,
 };
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::core::Interface;
 
-use crate::d3d11::{StagingTexture, create_d3d_device};
+use crate::d3d11::{MappedStagingTexture, StagingTexture, create_d3d_device, unmap_staging_texture};
 use crate::encoder::{ImageEncoder, ImageEncoderError, ImageEncoderPixelFormat, ImageFormat};
 use crate::monitor::Monitor;
 
@@ -72,6 +69,9 @@ pub enum Error {
     /// Invalid or mismatched staging texture supplied to [`DxgiDuplicationFrame::buffer_with`].
     #[error("Invalid staging texture: {0}")]
     InvalidStagingTexture(&'static str),
+    /// A DXGI/D3D call reported success but did not populate the requested output value.
+    #[error("Windows API succeeded but did not return {0}")]
+    UnexpectedNullResult(&'static str),
     /// Image encoding failed.
     ///
     /// Wraps [`crate::encoder::ImageEncoderError`].
@@ -92,19 +92,14 @@ pub enum Error {
 pub enum DxgiDuplicationFormat {
     /// 16-bit float RGBA format.
     Rgba16F,
-    /// 10-bit RGB with 2-bit alpha format.
-    Rgb10A2,
-    /// 10-bit RGB with 2-bit alpha format (biased).
-    Rgb10XrA2,
     /// 8-bit RGBA format.
     Rgba8,
-    /// 8-bit RGBA format (sRGB).
-    Rgba8Srgb,
     /// 8-bit BGRA format.
     Bgra8,
-    /// 8-bit BGRA format (sRGB).
-    Bgra8Srgb,
 }
+
+const DEFAULT_DUPLICATION_FORMATS: [DXGI_FORMAT; 3] =
+    [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM];
 
 /// A minimal, ergonomic wrapper around the DXGI Desktop Duplication API for capturing a monitor.
 ///
@@ -127,7 +122,66 @@ pub struct DxgiDuplicationApi {
     is_holding_frame: bool,
 }
 
+fn enable_per_monitor_dpi_awareness() -> Result<(), Error> {
+    match unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == E_ACCESSDENIED => Ok(()),
+        Err(error) => Err(Error::WindowsError(error)),
+    }
+}
+
+fn find_output_for_monitor(dxgi_device: &IDXGIDevice4, monitor: Monitor) -> Result<IDXGIOutput6, Error> {
+    let adapter = unsafe { dxgi_device.GetAdapter()? };
+    let mut index = 0u32;
+
+    loop {
+        match unsafe { adapter.EnumOutputs(index) } {
+            Ok(output) => {
+                let desc = unsafe { output.GetDesc()? };
+                if desc.Monitor.0 == monitor.as_raw_hmonitor() {
+                    return Ok(output.cast::<IDXGIOutput6>()?);
+                }
+                index += 1;
+            }
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => return Err(Error::OutputNotFound),
+            Err(error) => return Err(Error::WindowsError(error)),
+        }
+    }
+}
+
+fn map_supported_formats(supported_formats: &[DxgiDuplicationFormat]) -> Vec<DXGI_FORMAT> {
+    let mut supported_formats = supported_formats
+        .iter()
+        .map(|format| match format {
+            DxgiDuplicationFormat::Rgba16F => DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DxgiDuplicationFormat::Rgba8 => DXGI_FORMAT_R8G8B8A8_UNORM,
+            DxgiDuplicationFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        })
+        .collect::<Vec<_>>();
+
+    if !supported_formats.contains(&DXGI_FORMAT_B8G8R8A8_UNORM) {
+        supported_formats.push(DXGI_FORMAT_B8G8R8A8_UNORM);
+    }
+
+    supported_formats
+}
+
 impl DxgiDuplicationApi {
+    fn release_frame_if_needed(&mut self) -> Result<(), Error> {
+        if !self.is_holding_frame {
+            return Ok(());
+        }
+
+        match unsafe { self.duplication.ReleaseFrame() } {
+            Ok(()) => {
+                self.is_holding_frame = false;
+                Ok(())
+            }
+            Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => Err(Error::AccessLost),
+            Err(error) => Err(Error::WindowsError(error)),
+        }
+    }
+
     /// Constructs a new duplication session for the specified monitor.
     ///
     /// Internally creates a Direct3D 11 device and immediate context using the crate's d3d11
@@ -136,44 +190,12 @@ impl DxgiDuplicationApi {
         // Create D3D11 device and context.
         let (d3d_device, d3d_device_context) = create_d3d_device()?;
 
-        // Get the adapter used by the created device.
         let dxgi_device = d3d_device.cast::<IDXGIDevice4>()?;
-        let adapter = unsafe { dxgi_device.GetAdapter()? };
+        let output = find_output_for_monitor(&dxgi_device, monitor)?;
+        enable_per_monitor_dpi_awareness()?;
 
-        // Find the DXGI output that corresponds to the provided HMONITOR.
-        let found_output;
-        let mut index = 0u32;
-        loop {
-            let output = unsafe { adapter.EnumOutputs(index) }?;
-            let desc = unsafe { output.GetDesc()? };
-            if desc.Monitor.0 == monitor.as_raw_hmonitor() {
-                found_output = Some(output);
-                break;
-            }
-            index += 1;
-        }
-
-        let Some(output) = found_output else {
-            return Err(Error::OutputNotFound);
-        };
-
-        // Get IDXGIOutput6 for DuplicateOutput.
-        let output = output.cast::<IDXGIOutput6>()?;
-
-        // Set the process to be per-monitor DPI aware to handle high-DPI monitors correctly.
-        match unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
-            Ok(()) => (),
-            Err(e) => {
-                // returns E_ACCESSDENIED when the default API awareness mode for the process has already been set
-                // (via a previous API call or within the application manifest)
-                if e.code() != E_ACCESSDENIED {
-                    return Err(Error::WindowsError(e));
-                }
-            }
-        }
-
-        // Create the duplication for this output using the supplied D3D11 device.
-        let duplication = unsafe { output.DuplicateOutput(&d3d_device)? };
+        // Restrict the duplication to the crate-supported DXGI formats.
+        let duplication = unsafe { output.DuplicateOutput1(&d3d_device, 0, &DEFAULT_DUPLICATION_FORMATS)? };
 
         // Get the duplication description to determine the format for our internal texture.
         let duplication_desc = unsafe { duplication.GetDesc() };
@@ -192,67 +214,16 @@ impl DxgiDuplicationApi {
     /// Constructs a new duplication session for the specified monitor, using a custom list of
     /// supported DXGI formats.
     ///
-    /// This method allows directly receiving the original back buffer format used by a running
-    /// fullscreen application.
-    ///
-    /// Bgra8 is inserted because it is widely supported and serves as a reliable fallback.
+    /// This method lets callers prefer any subset of the crate-supported DXGI formats.
+    /// `Bgra8` is inserted because it is widely supported and serves as a reliable fallback.
     pub fn new_options(monitor: Monitor, supported_formats: &[DxgiDuplicationFormat]) -> Result<Self, Error> {
         // Create D3D11 device and context.
         let (d3d_device, d3d_device_context) = create_d3d_device()?;
 
-        // Get the adapter used by the created device.
         let dxgi_device = d3d_device.cast::<IDXGIDevice4>()?;
-        let adapter = unsafe { dxgi_device.GetAdapter()? };
-
-        // Find the DXGI output that corresponds to the provided HMONITOR.
-        let found_output;
-        let mut index = 0u32;
-        loop {
-            let output = unsafe { adapter.EnumOutputs(index) }?;
-            let desc = unsafe { output.GetDesc()? };
-            if desc.Monitor.0 == monitor.as_raw_hmonitor() {
-                found_output = Some(output);
-                break;
-            }
-            index += 1;
-        }
-
-        let Some(output) = found_output else {
-            return Err(Error::OutputNotFound);
-        };
-
-        // Get IDXGIOutput6 for DuplicateOutput1.
-        let output = output.cast::<IDXGIOutput6>()?;
-
-        // Map the supported formats to DXGI_FORMAT values.
-        let mut supported_formats = supported_formats
-            .iter()
-            .map(|f| match f {
-                DxgiDuplicationFormat::Rgba16F => DXGI_FORMAT_R16G16B16A16_FLOAT,
-                DxgiDuplicationFormat::Rgb10A2 => DXGI_FORMAT_R10G10B10A2_UNORM,
-                DxgiDuplicationFormat::Rgb10XrA2 => DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM,
-                DxgiDuplicationFormat::Rgba8 => DXGI_FORMAT_R8G8B8A8_UNORM,
-                DxgiDuplicationFormat::Rgba8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                DxgiDuplicationFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
-                DxgiDuplicationFormat::Bgra8Srgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-            })
-            .collect::<Vec<DXGI_FORMAT>>();
-
-        if !supported_formats.contains(&DXGI_FORMAT_B8G8R8A8_UNORM) {
-            supported_formats.push(DXGI_FORMAT_B8G8R8A8_UNORM);
-        }
-
-        // Set the process to be per-monitor DPI aware to handle high-DPI monitors correctly.
-        match unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {
-            Ok(()) => (),
-            Err(e) => {
-                // returns E_ACCESSDENIED when the default API awareness mode for the process has already been set
-                // (via a previous API call or within the application manifest)
-                if e.code() != E_ACCESSDENIED {
-                    return Err(Error::WindowsError(e));
-                }
-            }
-        }
+        let output = find_output_for_monitor(&dxgi_device, monitor)?;
+        let supported_formats = map_supported_formats(supported_formats);
+        enable_per_monitor_dpi_awareness()?;
 
         // Create the duplication for this output using the supplied D3D11 device.
         let duplication = unsafe { output.DuplicateOutput1(&d3d_device, 0, &supported_formats)? };
@@ -273,79 +244,29 @@ impl DxgiDuplicationApi {
 
     /// Recreates the duplication interface, mostly used after receiving an [`Error::AccessLost`]
     /// error from [`DxgiDuplicationApi::acquire_next_frame`].
-    pub fn recreate(self) -> Result<Self, Error> {
-        let Self {
-            d3d_device,
-            d3d_device_context,
-            duplication,
-            duplication_desc: _,
-            dxgi_device,
-            output,
-            is_holding_frame: _,
-        } = self;
+    pub fn recreate(mut self) -> Result<Self, Error> {
+        let _ = self.release_frame_if_needed();
 
-        drop(duplication);
+        self.duplication = unsafe { self.output.DuplicateOutput1(&self.d3d_device, 0, &DEFAULT_DUPLICATION_FORMATS)? };
+        self.duplication_desc = unsafe { self.duplication.GetDesc() };
+        self.is_holding_frame = false;
 
-        let duplication = unsafe { output.DuplicateOutput(&d3d_device)? };
-        let duplication_desc = unsafe { duplication.GetDesc() };
-
-        Ok(Self {
-            d3d_device,
-            d3d_device_context,
-            duplication,
-            duplication_desc,
-            dxgi_device,
-            output,
-            is_holding_frame: false,
-        })
+        Ok(self)
     }
 
     /// Recreates the duplication interface with a custom list of supported DXGI formats, mostly
     /// used after receiving an [`Error::AccessLost`] error from
     /// [`DxgiDuplicationApi::acquire_next_frame`].
-    pub fn recreate_options(self, supported_formats: &[DxgiDuplicationFormat]) -> Result<Self, Error> {
-        // Map the supported formats to DXGI_FORMAT values.
-        let mut supported_formats = supported_formats
-            .iter()
-            .map(|f| match f {
-                DxgiDuplicationFormat::Rgba16F => DXGI_FORMAT_R16G16B16A16_FLOAT,
-                DxgiDuplicationFormat::Rgb10A2 => DXGI_FORMAT_R10G10B10A2_UNORM,
-                DxgiDuplicationFormat::Rgb10XrA2 => DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM,
-                DxgiDuplicationFormat::Rgba8 => DXGI_FORMAT_R8G8B8A8_UNORM,
-                DxgiDuplicationFormat::Rgba8Srgb => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
-                DxgiDuplicationFormat::Bgra8 => DXGI_FORMAT_B8G8R8A8_UNORM,
-                DxgiDuplicationFormat::Bgra8Srgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-            })
-            .collect::<Vec<DXGI_FORMAT>>();
+    pub fn recreate_options(mut self, supported_formats: &[DxgiDuplicationFormat]) -> Result<Self, Error> {
+        let supported_formats = map_supported_formats(supported_formats);
 
-        if !supported_formats.contains(&DXGI_FORMAT_B8G8R8A8_UNORM) {
-            supported_formats.push(DXGI_FORMAT_B8G8R8A8_UNORM);
-        }
+        let _ = self.release_frame_if_needed();
 
-        let Self {
-            d3d_device,
-            d3d_device_context,
-            duplication,
-            duplication_desc: _,
-            dxgi_device,
-            output,
-            is_holding_frame: _,
-        } = self;
+        self.duplication = unsafe { self.output.DuplicateOutput1(&self.d3d_device, 0, &supported_formats)? };
+        self.duplication_desc = unsafe { self.duplication.GetDesc() };
+        self.is_holding_frame = false;
 
-        drop(duplication);
-
-        let duplication = unsafe { output.DuplicateOutput1(&d3d_device, 0, &supported_formats)? };
-        let duplication_desc = unsafe { duplication.GetDesc() };
-
-        Ok(Self {
-            d3d_device,
-            d3d_device_context,
-            duplication,
-            duplication_desc,
-            dxgi_device,
-            output,
-            is_holding_frame: false,
-        })
+        Ok(self)
     }
 
     /// Gets the underlying [`windows::Win32::Graphics::Direct3D11::ID3D11Device`] associated with
@@ -412,12 +333,8 @@ impl DxgiDuplicationApi {
     pub const fn format(&self) -> DxgiDuplicationFormat {
         match self.duplication_desc.ModeDesc.Format {
             DXGI_FORMAT_R16G16B16A16_FLOAT => DxgiDuplicationFormat::Rgba16F,
-            DXGI_FORMAT_R10G10B10A2_UNORM => DxgiDuplicationFormat::Rgb10A2,
-            DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM => DxgiDuplicationFormat::Rgb10XrA2,
             DXGI_FORMAT_R8G8B8A8_UNORM => DxgiDuplicationFormat::Rgba8,
-            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DxgiDuplicationFormat::Rgba8Srgb,
             DXGI_FORMAT_B8G8R8A8_UNORM => DxgiDuplicationFormat::Bgra8,
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DxgiDuplicationFormat::Bgra8Srgb,
             _ => unreachable!(),
         }
     }
@@ -454,19 +371,7 @@ impl DxgiDuplicationApi {
         let mut resource = None;
 
         // Release the previous frame if we were holding one
-        if self.is_holding_frame {
-            match unsafe { self.duplication.ReleaseFrame() } {
-                Ok(()) => (),
-                Err(e) => {
-                    if e.code() == DXGI_ERROR_ACCESS_LOST {
-                        return Err(Error::AccessLost);
-                    } else {
-                        return Err(Error::WindowsError(e));
-                    }
-                }
-            }
-            self.is_holding_frame = false;
-        }
+        self.release_frame_if_needed()?;
 
         // Acquire frame
         match unsafe { self.duplication.AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource) } {
@@ -483,7 +388,7 @@ impl DxgiDuplicationApi {
         }
         self.is_holding_frame = true;
 
-        let resource = resource.unwrap();
+        let resource = resource.ok_or(Error::UnexpectedNullResult("an acquired DXGI frame resource"))?;
 
         // Convert the resource to an ID3D11Texture2D.
         let frame_texture = resource.cast::<ID3D11Texture2D>()?;
@@ -500,6 +405,12 @@ impl DxgiDuplicationApi {
             texture_desc: frame_desc,
             frame_info,
         })
+    }
+}
+
+impl Drop for DxgiDuplicationApi {
+    fn drop(&mut self) {
+        let _ = self.release_frame_if_needed();
     }
 }
 
@@ -536,12 +447,8 @@ impl<'a> DxgiDuplicationFrame<'a> {
     pub const fn format(&self) -> DxgiDuplicationFormat {
         match self.texture_desc.Format {
             DXGI_FORMAT_R16G16B16A16_FLOAT => DxgiDuplicationFormat::Rgba16F,
-            DXGI_FORMAT_R10G10B10A2_UNORM => DxgiDuplicationFormat::Rgb10A2,
-            DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM => DxgiDuplicationFormat::Rgb10XrA2,
             DXGI_FORMAT_R8G8B8A8_UNORM => DxgiDuplicationFormat::Rgba8,
-            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DxgiDuplicationFormat::Rgba8Srgb,
             DXGI_FORMAT_B8G8R8A8_UNORM => DxgiDuplicationFormat::Bgra8,
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DxgiDuplicationFormat::Bgra8Srgb,
             _ => unreachable!(),
         }
     }
@@ -598,61 +505,25 @@ impl<'a> DxgiDuplicationFrame<'a> {
     /// representation.
     #[inline]
     pub fn buffer<'b>(&'b mut self) -> Result<DxgiDuplicationFrameBuffer<'b>, Error> {
-        // Staging texture settings
-        let texture_desc = D3D11_TEXTURE2D_DESC {
-            Width: self.texture_desc.Width,
-            Height: self.texture_desc.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: self.texture_desc.Format,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32 | D3D11_CPU_ACCESS_WRITE.0 as u32,
-            MiscFlags: 0,
-        };
-
-        // Create a CPU-readable staging texture
-        let mut staging = None;
-        unsafe {
-            self.d3d_device.CreateTexture2D(&texture_desc, None, Some(&mut staging))?;
-        };
-        let staging = staging.unwrap();
+        let staging = StagingTexture::new(
+            self.d3d_device,
+            self.texture_desc.Width,
+            self.texture_desc.Height,
+            self.texture_desc.Format,
+        )?;
 
         // Copy from the internal GPU texture into the staging texture
         unsafe {
-            self.d3d_device_context.CopyResource(&staging, &self.texture);
-        };
+            self.d3d_device_context.CopyResource(staging.texture(), &self.texture);
+        }
 
-        // Map the staging texture for CPU access
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.d3d_device_context.Map(&staging, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
-        };
+        let mapped_texture = MappedStagingTexture::map_owned(self.d3d_device_context, staging)?;
 
-        // SAFETY: The staging texture remains alive for the scope of this function.
-        let mapped_frame_data = unsafe {
-            slice::from_raw_parts_mut(mapped.pData.cast(), (self.texture_desc.Height * mapped.RowPitch) as usize)
-        };
-
-        let format = match self.texture_desc.Format {
-            DXGI_FORMAT_R16G16B16A16_FLOAT => DxgiDuplicationFormat::Rgba16F,
-            DXGI_FORMAT_R10G10B10A2_UNORM => DxgiDuplicationFormat::Rgb10A2,
-            DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM => DxgiDuplicationFormat::Rgb10XrA2,
-            DXGI_FORMAT_R8G8B8A8_UNORM => DxgiDuplicationFormat::Rgba8,
-            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DxgiDuplicationFormat::Rgba8Srgb,
-            DXGI_FORMAT_B8G8R8A8_UNORM => DxgiDuplicationFormat::Bgra8,
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DxgiDuplicationFormat::Bgra8Srgb,
-            _ => unreachable!(),
-        };
-
-        Ok(DxgiDuplicationFrameBuffer::new(
-            mapped_frame_data,
+        Ok(DxgiDuplicationFrameBuffer::from_mapped(
+            mapped_texture,
             self.texture_desc.Width,
             self.texture_desc.Height,
-            mapped.RowPitch,
-            mapped.DepthPitch,
-            format,
+            self.format(),
         ))
     }
 
@@ -672,64 +543,28 @@ impl<'a> DxgiDuplicationFrame<'a> {
         let texture_width = end_x - start_x;
         let texture_height = end_y - start_y;
 
-        // Staging texture settings for the cropped region
-        let texture_desc = D3D11_TEXTURE2D_DESC {
-            Width: texture_width,
-            Height: texture_height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: self.texture_desc.Format,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32 | D3D11_CPU_ACCESS_WRITE.0 as u32,
-            MiscFlags: 0,
-        };
-
-        // Create a CPU-readable staging texture of the crop size
-        let mut staging = None;
-        unsafe {
-            self.d3d_device.CreateTexture2D(&texture_desc, None, Some(&mut staging))?;
-        };
-        let staging = staging.unwrap();
+        let staging = StagingTexture::new(self.d3d_device, texture_width, texture_height, self.texture_desc.Format)?;
 
         // Define the source box to copy from the duplication texture
         let src_box = D3D11_BOX { left: start_x, top: start_y, front: 0, right: end_x, bottom: end_y, back: 1 };
 
         // Copy the selected region into the staging texture at (0,0)
         unsafe {
-            self.d3d_device_context.CopySubresourceRegion(&staging, 0, 0, 0, 0, &self.texture, 0, Some(&src_box));
+            self.d3d_device_context.CopySubresourceRegion(
+                staging.texture(),
+                0,
+                0,
+                0,
+                0,
+                &self.texture,
+                0,
+                Some(&src_box),
+            );
         }
 
-        // Map the staging texture for CPU access
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.d3d_device_context.Map(&staging, 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
-        }
+        let mapped_texture = MappedStagingTexture::map_owned(self.d3d_device_context, staging)?;
 
-        // SAFETY: staging remains alive for the scope of this function.
-        let mapped_frame_data =
-            unsafe { slice::from_raw_parts_mut(mapped.pData.cast(), (texture_height * mapped.RowPitch) as usize) };
-
-        let format = match self.texture_desc.Format {
-            DXGI_FORMAT_R16G16B16A16_FLOAT => DxgiDuplicationFormat::Rgba16F,
-            DXGI_FORMAT_R10G10B10A2_UNORM => DxgiDuplicationFormat::Rgb10A2,
-            DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM => DxgiDuplicationFormat::Rgb10XrA2,
-            DXGI_FORMAT_R8G8B8A8_UNORM => DxgiDuplicationFormat::Rgba8,
-            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DxgiDuplicationFormat::Rgba8Srgb,
-            DXGI_FORMAT_B8G8R8A8_UNORM => DxgiDuplicationFormat::Bgra8,
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DxgiDuplicationFormat::Bgra8Srgb,
-            _ => unreachable!(),
-        };
-
-        Ok(DxgiDuplicationFrameBuffer::new(
-            mapped_frame_data,
-            texture_width,
-            texture_height,
-            mapped.RowPitch,
-            mapped.DepthPitch,
-            format,
-        ))
+        Ok(DxgiDuplicationFrameBuffer::from_mapped(mapped_texture, texture_width, texture_height, self.format()))
     }
 
     /// Advanced: reuse your own CPU staging texture ([`crate::d3d11::StagingTexture`]).
@@ -751,47 +586,20 @@ impl<'a> DxgiDuplicationFrame<'a> {
             return Err(Error::InvalidStagingTexture("format must match the frame"));
         }
 
-        // Unmap if was previously mapped
-        if staging.is_mapped() {
-            unsafe { self.d3d_device_context.Unmap(staging.texture(), 0) };
-            staging.set_mapped(false);
-        }
+        unmap_staging_texture(self.d3d_device_context, staging);
 
         // Copy the acquired duplication texture into the provided staging texture
         unsafe {
             self.d3d_device_context.CopyResource(staging.texture(), &self.texture);
         }
 
-        // Map the staging texture for CPU access
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.d3d_device_context.Map(staging.texture(), 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
-        }
-        staging.set_mapped(true);
+        let mapped_texture = MappedStagingTexture::map_borrowed(self.d3d_device_context, staging)?;
 
-        // SAFETY: staging lives for 's and remains alive while the FrameBuffer is borrowed.
-        let mapped_frame_data = unsafe {
-            slice::from_raw_parts_mut(mapped.pData.cast(), (self.texture_desc.Height * mapped.RowPitch) as usize)
-        };
-
-        let format = match self.texture_desc.Format {
-            DXGI_FORMAT_R16G16B16A16_FLOAT => DxgiDuplicationFormat::Rgba16F,
-            DXGI_FORMAT_R10G10B10A2_UNORM => DxgiDuplicationFormat::Rgb10A2,
-            DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM => DxgiDuplicationFormat::Rgb10XrA2,
-            DXGI_FORMAT_R8G8B8A8_UNORM => DxgiDuplicationFormat::Rgba8,
-            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DxgiDuplicationFormat::Rgba8Srgb,
-            DXGI_FORMAT_B8G8R8A8_UNORM => DxgiDuplicationFormat::Bgra8,
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DxgiDuplicationFormat::Bgra8Srgb,
-            _ => unreachable!(),
-        };
-
-        Ok(DxgiDuplicationFrameBuffer::new(
-            mapped_frame_data,
+        Ok(DxgiDuplicationFrameBuffer::from_mapped(
+            mapped_texture,
             self.texture_desc.Width,
             self.texture_desc.Height,
-            mapped.RowPitch,
-            mapped.DepthPitch,
-            format,
+            self.format(),
         ))
     }
 
@@ -825,11 +633,7 @@ impl<'a> DxgiDuplicationFrame<'a> {
             return Err(Error::InvalidStagingTexture("staging texture too small for crop region"));
         }
 
-        // Unmap if was previously mapped
-        if staging.is_mapped() {
-            unsafe { self.d3d_device_context.Unmap(staging.texture(), 0) };
-            staging.set_mapped(false);
-        }
+        unmap_staging_texture(self.d3d_device_context, staging);
 
         // Define the source region to copy
         let src_box = D3D11_BOX { left: start_x, top: start_y, front: 0, right: end_x, bottom: end_y, back: 1 };
@@ -848,36 +652,9 @@ impl<'a> DxgiDuplicationFrame<'a> {
             );
         }
 
-        // Map the staging texture
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.d3d_device_context.Map(staging.texture(), 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
-        }
-        staging.set_mapped(true);
+        let mapped_texture = MappedStagingTexture::map_borrowed(self.d3d_device_context, staging)?;
 
-        // SAFETY: staging lives for 's and remains alive while the FrameBuffer is borrowed.
-        let mapped_frame_data =
-            unsafe { slice::from_raw_parts_mut(mapped.pData.cast(), (crop_height * mapped.RowPitch) as usize) };
-
-        let format = match self.texture_desc.Format {
-            DXGI_FORMAT_R16G16B16A16_FLOAT => DxgiDuplicationFormat::Rgba16F,
-            DXGI_FORMAT_R10G10B10A2_UNORM => DxgiDuplicationFormat::Rgb10A2,
-            DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM => DxgiDuplicationFormat::Rgb10XrA2,
-            DXGI_FORMAT_R8G8B8A8_UNORM => DxgiDuplicationFormat::Rgba8,
-            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => DxgiDuplicationFormat::Rgba8Srgb,
-            DXGI_FORMAT_B8G8R8A8_UNORM => DxgiDuplicationFormat::Bgra8,
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => DxgiDuplicationFormat::Bgra8Srgb,
-            _ => unreachable!(),
-        };
-
-        Ok(DxgiDuplicationFrameBuffer::new(
-            mapped_frame_data,
-            crop_width,
-            crop_height,
-            mapped.RowPitch,
-            mapped.DepthPitch,
-            format,
-        ))
+        Ok(DxgiDuplicationFrameBuffer::from_mapped(mapped_texture, crop_width, crop_height, self.format()))
     }
 
     /// Saves the frame buffer as an image to the specified path.
@@ -899,8 +676,30 @@ impl<'a> DxgiDuplicationFrame<'a> {
 /// let mut buffer = frame.buffer()?;
 /// buffer.save_as_image("screenshot.png", ImageFormat::Png)?;
 /// ```
+enum DxgiDuplicationFrameBufferBacking<'a> {
+    Borrowed(&'a mut [u8]),
+    Mapped(MappedStagingTexture<'a>),
+}
+
+impl DxgiDuplicationFrameBufferBacking<'_> {
+    const fn as_slice(&self, height: u32) -> &[u8] {
+        match self {
+            Self::Borrowed(buffer) => buffer,
+            Self::Mapped(texture) => texture.as_slice(height),
+        }
+    }
+
+    const fn as_mut_slice(&mut self, height: u32) -> &mut [u8] {
+        match self {
+            Self::Borrowed(buffer) => buffer,
+            Self::Mapped(texture) => texture.as_mut_slice(height),
+        }
+    }
+}
+
+/// Represents a CPU-readable frame buffer produced from a duplication frame.
 pub struct DxgiDuplicationFrameBuffer<'a> {
-    raw_buffer: &'a mut [u8],
+    backing: DxgiDuplicationFrameBufferBacking<'a>,
     width: u32,
     height: u32,
     row_pitch: u32,
@@ -920,7 +719,33 @@ impl<'a> DxgiDuplicationFrameBuffer<'a> {
         depth_pitch: u32,
         format: DxgiDuplicationFormat,
     ) -> Self {
-        Self { raw_buffer, width, height, row_pitch, depth_pitch, format }
+        Self {
+            backing: DxgiDuplicationFrameBufferBacking::Borrowed(raw_buffer),
+            width,
+            height,
+            row_pitch,
+            depth_pitch,
+            format,
+        }
+    }
+
+    const fn from_mapped(
+        mapped_texture: MappedStagingTexture<'a>,
+        width: u32,
+        height: u32,
+        format: DxgiDuplicationFormat,
+    ) -> Self {
+        let row_pitch = mapped_texture.row_pitch();
+        let depth_pitch = mapped_texture.depth_pitch();
+
+        Self {
+            backing: DxgiDuplicationFrameBufferBacking::Mapped(mapped_texture),
+            width,
+            height,
+            row_pitch,
+            depth_pitch,
+            format,
+        }
     }
 
     /// Gets the width of the frame buffer.
@@ -962,44 +787,38 @@ impl<'a> DxgiDuplicationFrameBuffer<'a> {
     #[inline]
     #[must_use]
     pub const fn has_padding(&self) -> bool {
-        self.width * 4 != self.row_pitch
+        self.width * self.bytes_per_pixel() != self.row_pitch
     }
 
     /// Gets the pixel data without padding.
     #[inline]
     #[must_use]
     pub fn as_nopadding_buffer<'b>(&'b self, buffer: &'b mut Vec<u8>) -> &'b [u8] {
+        let raw_buffer = self.backing.as_slice(self.height);
+
         if !self.has_padding() {
-            return self.raw_buffer;
+            return raw_buffer;
         }
 
-        let multiplier = match self.format {
-            DxgiDuplicationFormat::Rgba16F => 8,
-            DxgiDuplicationFormat::Rgb10A2 => 4,
-            DxgiDuplicationFormat::Rgb10XrA2 => 4,
-            DxgiDuplicationFormat::Rgba8 => 4,
-            DxgiDuplicationFormat::Rgba8Srgb => 4,
-            DxgiDuplicationFormat::Bgra8 => 4,
-            DxgiDuplicationFormat::Bgra8Srgb => 4,
-        };
-
-        let frame_size = (self.width * self.height * multiplier) as usize;
-        if buffer.capacity() < frame_size {
+        let width = self.width;
+        let height = self.height;
+        let row_pitch = self.row_pitch;
+        let multiplier = self.bytes_per_pixel();
+        let frame_size = (width * height * multiplier) as usize;
+        if buffer.len() < frame_size {
             buffer.resize(frame_size, 0);
         }
 
-        let width_size = (self.width * multiplier) as usize;
-        let buffer_address = buffer.as_mut_ptr() as isize;
-        (0..self.height).into_par_iter().for_each(|y| {
-            let index = (y * self.row_pitch) as usize;
-            let ptr = buffer_address as *mut u8;
+        let width_size = (width * multiplier) as usize;
+        let buffer_address = buffer.as_mut_ptr() as usize;
+        let raw_buffer_address = raw_buffer.as_ptr() as usize;
+        (0..height).into_par_iter().for_each(|y| {
+            let index = (y * row_pitch) as usize;
+            let src = raw_buffer_address as *const u8;
+            let dst = buffer_address as *mut u8;
 
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.raw_buffer.as_ptr().add(index),
-                    ptr.add(y as usize * width_size),
-                    width_size,
-                );
+                std::ptr::copy_nonoverlapping(src.add(index), dst.add(y as usize * width_size), width_size);
             }
         });
 
@@ -1010,7 +829,7 @@ impl<'a> DxgiDuplicationFrameBuffer<'a> {
     #[inline]
     #[must_use]
     pub const fn as_raw_buffer(&mut self) -> &mut [u8] {
-        self.raw_buffer
+        self.backing.as_mut_slice(self.height)
     }
 
     /// Saves the frame buffer as an image to the specified path.
@@ -1032,5 +851,14 @@ impl<'a> DxgiDuplicationFrameBuffer<'a> {
         fs::write(path, bytes)?;
 
         Ok(())
+    }
+
+    #[inline]
+    #[must_use]
+    const fn bytes_per_pixel(&self) -> u32 {
+        match self.format {
+            DxgiDuplicationFormat::Rgba16F => 8,
+            DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Bgra8 => 4,
+        }
     }
 }

@@ -9,8 +9,8 @@ struct WinMTACookie {
 
 impl WinMTACookie {
     /// Increments the current threads MTA usage.
-    pub fn new() -> Self {
-        Self { cookie: unsafe { CoIncrementMTAUsage() }.expect("Failed to increment MTA usage") }
+    pub fn new() -> windows::core::Result<Self> {
+        Ok(Self { cookie: unsafe { CoIncrementMTAUsage()? } })
     }
 }
 
@@ -22,28 +22,26 @@ impl Drop for WinMTACookie {
 
 /// Panic safe wrapper for WinRT api initialization.
 pub struct WinRT {
-    cookie: WinMTACookie,
+    _cookie: WinMTACookie,
 }
 
 impl WinRT {
     /// Initializes WinRT apis on the current thread.
-    pub fn new() -> Self {
-        let cookie = WinMTACookie::new();
+    pub fn new() -> windows::core::Result<Self> {
+        let cookie = WinMTACookie::new()?;
 
         if let Err(e) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
             && e.code() != S_FALSE
         {
-            panic!("Failed to initialize WinRT");
+            return Err(e);
         }
 
-        Self { cookie }
+        Ok(Self { _cookie: cookie })
     }
 }
 
 impl Drop for WinRT {
     fn drop(&mut self) {
         unsafe { RoUninitialize() };
-
-        let _ = self.cookie;
     }
 }

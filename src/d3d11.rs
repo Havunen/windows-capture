@@ -1,3 +1,5 @@
+use std::slice;
+
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
@@ -5,8 +7,9 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+    D3D11_CPU_ACCESS_READ, D3D11_CPU_ACCESS_WRITE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ_WRITE,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice,
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
@@ -19,6 +22,9 @@ pub enum Error {
     /// The created device does not support at least feature level 11.0.
     #[error("Failed to create DirectX device with the recommended feature levels")]
     FeatureLevelNotSatisfied,
+    /// A Win32 API reported success but did not populate the requested output value.
+    #[error("Windows API succeeded but did not return {0}")]
+    UnexpectedNullResult(&'static str),
     /// A Windows Runtime/Win32 API call failed.
     ///
     /// Wraps [`windows::core::Error`].
@@ -40,6 +46,108 @@ impl<T> SendDirectX<T> {
 
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl<T> Send for SendDirectX<T> {}
+
+enum StagingTextureHandle<'a> {
+    Owned(StagingTexture),
+    Borrowed(&'a mut StagingTexture),
+}
+
+impl StagingTextureHandle<'_> {
+    const fn texture(&self) -> &ID3D11Texture2D {
+        match self {
+            Self::Owned(texture) => texture.texture(),
+            Self::Borrowed(texture) => texture.texture(),
+        }
+    }
+
+    const fn set_mapped(&mut self, mapped: bool) {
+        match self {
+            Self::Owned(texture) => texture.set_mapped(mapped),
+            Self::Borrowed(texture) => texture.set_mapped(mapped),
+        }
+    }
+}
+
+/// A mapped staging texture that automatically unmaps itself when dropped.
+pub(crate) struct MappedStagingTexture<'a> {
+    context: &'a ID3D11DeviceContext,
+    texture: StagingTextureHandle<'a>,
+    mapped: D3D11_MAPPED_SUBRESOURCE,
+}
+
+impl<'a> MappedStagingTexture<'a> {
+    /// Maps an owned staging texture.
+    pub fn map_owned(context: &'a ID3D11DeviceContext, texture: StagingTexture) -> Result<Self, windows::core::Error> {
+        Self::map(context, StagingTextureHandle::Owned(texture))
+    }
+
+    /// Maps a caller-provided staging texture after making sure it is currently unmapped.
+    pub fn map_borrowed(
+        context: &'a ID3D11DeviceContext,
+        texture: &'a mut StagingTexture,
+    ) -> Result<Self, windows::core::Error> {
+        unmap_staging_texture(context, texture);
+        Self::map(context, StagingTextureHandle::Borrowed(texture))
+    }
+
+    fn map(
+        context: &'a ID3D11DeviceContext,
+        mut texture: StagingTextureHandle<'a>,
+    ) -> Result<Self, windows::core::Error> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            context.Map(texture.texture(), 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))?;
+        }
+        texture.set_mapped(true);
+
+        Ok(Self { context, texture, mapped })
+    }
+
+    /// Returns the mapped bytes as an immutable slice for the requested number of rows.
+    #[must_use]
+    pub const fn as_slice(&self, rows: u32) -> &[u8] {
+        let len = rows as usize * self.mapped.RowPitch as usize;
+        unsafe { slice::from_raw_parts(self.mapped.pData.cast(), len) }
+    }
+
+    /// Returns the mapped bytes as a mutable slice for the requested number of rows.
+    #[must_use]
+    pub const fn as_mut_slice(&mut self, rows: u32) -> &mut [u8] {
+        let len = rows as usize * self.mapped.RowPitch as usize;
+        unsafe { slice::from_raw_parts_mut(self.mapped.pData.cast(), len) }
+    }
+
+    /// Returns the row pitch reported by D3D11 for the mapped texture.
+    #[must_use]
+    pub const fn row_pitch(&self) -> u32 {
+        self.mapped.RowPitch
+    }
+
+    /// Returns the depth pitch reported by D3D11 for the mapped texture.
+    #[must_use]
+    pub const fn depth_pitch(&self) -> u32 {
+        self.mapped.DepthPitch
+    }
+}
+
+impl Drop for MappedStagingTexture<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.context.Unmap(self.texture.texture(), 0);
+        }
+        self.texture.set_mapped(false);
+    }
+}
+
+/// Unmaps a staging texture if it is currently mapped.
+pub(crate) fn unmap_staging_texture(context: &ID3D11DeviceContext, texture: &mut StagingTexture) {
+    if texture.is_mapped() {
+        unsafe {
+            context.Unmap(texture.texture(), 0);
+        }
+        texture.set_mapped(false);
+    }
+}
 
 /// Creates an [`windows::Win32::Graphics::Direct3D11::ID3D11Device`] and an
 /// [`windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext`].
@@ -86,7 +194,10 @@ pub fn create_d3d_device() -> Result<(ID3D11Device, ID3D11DeviceContext), Error>
         return Err(Error::FeatureLevelNotSatisfied);
     }
 
-    Ok((d3d_device.unwrap(), d3d_device_context.unwrap()))
+    let d3d_device = d3d_device.ok_or(Error::UnexpectedNullResult("an `ID3D11Device`"))?;
+    let d3d_device_context = d3d_device_context.ok_or(Error::UnexpectedNullResult("an `ID3D11DeviceContext`"))?;
+
+    Ok((d3d_device, d3d_device_context))
 }
 
 /// Creates an [`windows::Graphics::DirectX::Direct3D11::IDirect3DDevice`] from an
@@ -131,7 +242,9 @@ impl StagingTexture {
         unsafe {
             device.CreateTexture2D(&desc, None, Some(&mut tex))?;
         }
-        Ok(Self { inner: tex.unwrap(), desc, is_mapped: false })
+        let inner = tex.ok_or(Error::UnexpectedNullResult("an `ID3D11Texture2D`"))?;
+
+        Ok(Self { inner, desc, is_mapped: false })
     }
 
     /// Gets the underlying [`windows::Win32::Graphics::Direct3D11::ID3D11Texture2D`].
@@ -168,7 +281,8 @@ impl StagingTexture {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { tex.GetDesc(&mut desc) };
         let is_staging = desc.Usage == D3D11_USAGE_STAGING;
-        let has_cpu_rw = (desc.CPUAccessFlags & (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32) != 0;
+        let cpu_rw_mask = (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32;
+        let has_cpu_rw = (desc.CPUAccessFlags & cpu_rw_mask) == cpu_rw_mask;
 
         if !is_staging || !has_cpu_rw {
             return None;
