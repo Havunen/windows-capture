@@ -1,4 +1,4 @@
-use windows_capture::dxgi_duplication_api::DxgiDuplicationApi;
+use windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, DxgiDuplicationFormat};
 use windows_capture::encoder::ImageFormat;
 use windows_capture::monitor::Monitor;
 
@@ -6,8 +6,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Select a monitor (primary in this example)
     let monitor = Monitor::primary()?;
 
-    // Create a duplication session for this monitor
-    let mut dup = DxgiDuplicationApi::new(monitor)?;
+    // Create a duplication session for this monitor in a PNG-compatible format
+    let mut dup = DxgiDuplicationApi::new_options(monitor, &[DxgiDuplicationFormat::Bgra8])?;
 
     // Try to grab one frame within ~33ms (about 30 FPS budget)
     let mut frame = dup.acquire_next_frame(33)?;
