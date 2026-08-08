@@ -284,26 +284,31 @@ impl VideoSettingsBuilder {
         self.sub_type = sub_type;
         self
     }
+
     /// Sets target bitrate in bits per second.
     pub const fn bitrate(mut self, bitrate: u32) -> Self {
         self.bitrate = bitrate;
         self
     }
+
     /// Sets target frame width in pixels.
     pub const fn width(mut self, width: u32) -> Self {
         self.width = width;
         self
     }
+
     /// Sets target frame height in pixels.
     pub const fn height(mut self, height: u32) -> Self {
         self.height = height;
         self
     }
+
     /// Sets target frame rate (numerator; denominator is fixed to 1).
     pub const fn frame_rate(mut self, frame_rate: u32) -> Self {
         self.frame_rate = frame_rate;
         self
     }
+
     /// Sets pixel aspect ratio as (numerator, denominator).
     pub const fn pixel_aspect_ratio(mut self, par: (u32, u32)) -> Self {
         self.pixel_aspect_ratio = par;

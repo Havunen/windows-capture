@@ -160,7 +160,8 @@ struct Cli {
     #[arg(long, default_value = "default")]
     secondary_window: String,
 
-    /// Specifies the minimum update interval in milliseconds.
+    /// Requests a minimum interval between eligible updates, in milliseconds. This limits the
+    /// update rate but does not guarantee a constant frame rate.
     #[arg(long)]
     minimum_update_interval: Option<u64>,
 

@@ -75,12 +75,21 @@ pub enum SecondaryWindowSettings {
     Exclude,
 }
 
-/// Defines the minimum interval between frame updates.
+/// Controls the minimum interval between frame updates requested from Windows Graphics Capture.
+///
+/// This is an OS-side throttle, not a target frame rate. A custom interval limits how frequently
+/// updates are eligible for delivery, but it does not make Windows produce frames periodically or
+/// guarantee a constant rate. The actual rate can be lower and depends on source/compositor
+/// updates, display timing, system load, and how quickly captured frames are consumed.
+///
+/// Consumers that require a fixed cadence must pace the output themselves, dropping excess frames
+/// or duplicating the latest frame when necessary. [`crate::frame::Frame::timestamp`] provides the
+/// capture timestamp for that purpose.
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum MinimumUpdateIntervalSettings {
-    /// Use the system's default update interval.
+    /// Leave the Windows Graphics Capture update interval unchanged.
     Default,
-    /// Specify a custom minimum update interval.
+    /// Request a custom minimum interval between eligible frame updates.
     Custom(Duration),
 }
 

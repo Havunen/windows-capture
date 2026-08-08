@@ -140,7 +140,8 @@
 //!     DrawBorderSettings::Default,
 //!     // Secondary window settings, if you want to include secondary windows in the capture
 //!     SecondaryWindowSettings::Default,
-//!     // Minimum update interval, if you want to change the frame rate limit (default is 60 FPS or 16.67 ms)
+//!     // Minimum interval between eligible updates. This limits the update rate but does not
+//!     // guarantee a constant frame rate. Default leaves the Windows setting unchanged.
 //!     MinimumUpdateIntervalSettings::Default,
 //!     // Dirty region settings
 //!     DirtyRegionSettings::Default,

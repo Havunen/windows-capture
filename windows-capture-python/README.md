@@ -67,6 +67,10 @@ def on_closed():
 capture.start()
 ```
 
+`minimum_update_interval` optionally requests a minimum interval between eligible Graphics Capture
+updates, in milliseconds. It limits the update rate but does not guarantee a constant frame rate;
+`None` leaves the Windows setting unchanged.
+
 ### DXGI Desktop Duplication API
 
 ```python

@@ -1,16 +1,21 @@
 """Fastest Windows Screen Capture Library For Python 🔥."""
 
+from __future__ import annotations
+
+import types
+
+import cv2
+import numpy
+
 from .windows_capture import (
-    NativeWindowsCapture,
     NativeCaptureControl,
     NativeDxgiDuplication,
-    NativeDxgiDuplicationFrame,
     NativeMappedFrame,
+    NativeWindowsCapture,
 )
-import numpy
-import cv2
-import types
-from typing import Optional
+from .windows_capture import (
+    NativeDxgiDuplicationFrame as NativeDxgiDuplicationFrame,
+)
 
 
 class Frame:
@@ -55,7 +60,7 @@ class Frame:
         """Save The Frame As An Image To The Specified Path"""
         cv2.imwrite(path, self.frame_buffer)
 
-    def convert_to_bgr(self) -> "Frame":
+    def convert_to_bgr(self) -> Frame:
         """Converts The self.frame_buffer Pixel Type To Bgr Instead Of Bgra"""
         bgr_frame_buffer = self.frame_buffer[:, :, :3]
 
@@ -63,7 +68,7 @@ class Frame:
 
     def crop(
         self, start_width: int, start_height: int, end_width: int, end_height: int
-    ) -> "Frame":
+    ) -> Frame:
         """Crops The Frame To The Specified Region"""
         cropped_frame_buffer = self.frame_buffer[
             start_height:end_height, start_width:end_width, :
@@ -172,14 +177,14 @@ class WindowsCapture:
 
     def __init__(
         self,
-        cursor_capture: Optional[bool] = True,
-        draw_border: Optional[bool] = None,
-        secondary_window: Optional[bool] = None,
-        minimum_update_interval: Optional[int] = None,
-        dirty_region: Optional[bool] = None,
-        monitor_index: Optional[int] = None,
-        window_name: Optional[str] = None,
-        window_hwnd: Optional[int] = None,
+        cursor_capture: bool | None = True,
+        draw_border: bool | None = None,
+        secondary_window: bool | None = None,
+        minimum_update_interval: int | None = None,
+        dirty_region: bool | None = None,
+        monitor_index: int | None = None,
+        window_name: str | None = None,
+        window_hwnd: int | None = None,
     ) -> None:
         """
         Constructs All The Necessary Attributes For The WindowsCapture Object
@@ -195,7 +200,8 @@ class WindowsCapture:
             secondary_window : bool
                 Whether To Capture A Secondary Window
             minimum_update_interval : int
-                Minimum Update Interval In Milliseconds
+                Requested minimum interval between eligible updates, in milliseconds. This limits
+                the update rate but does not guarantee a constant frame rate.
             dirty_region : bool
                 Whether To Report And Render Dirty Regions
             monitor_index : int
@@ -210,8 +216,8 @@ class WindowsCapture:
         if window_name is not None or window_hwnd is not None:
             monitor_index = None
 
-        self.frame_handler: Optional[types.FunctionType] = None
-        self.closed_handler: Optional[types.FunctionType] = None
+        self.frame_handler: types.FunctionType | None = None
+        self.closed_handler: types.FunctionType | None = None
         self.capture = NativeWindowsCapture(
             self.on_frame_arrived,
             self.on_closed,
@@ -228,18 +234,18 @@ class WindowsCapture:
     def start(self) -> None:
         """Starts The Capture Thread"""
         if self.frame_handler is None:
-            raise Exception("on_frame_arrived Event Handler Is Not Set")
+            raise RuntimeError("on_frame_arrived Event Handler Is Not Set")
         elif self.closed_handler is None:
-            raise Exception("on_closed Event Handler Is Not Set")
+            raise RuntimeError("on_closed Event Handler Is Not Set")
 
         self.capture.start()
 
     def start_free_threaded(self) -> CaptureControl:
         """Starts The Capture Thread On A Dedicated Thread"""
         if self.frame_handler is None:
-            raise Exception("on_frame_arrived Event Handler Is Not Set")
+            raise RuntimeError("on_frame_arrived Event Handler Is Not Set")
         elif self.closed_handler is None:
-            raise Exception("on_closed Event Handler Is Not Set")
+            raise RuntimeError("on_closed Event Handler Is Not Set")
 
         native_capture_control = self.capture.start_free_threaded()
 
@@ -277,14 +283,14 @@ class WindowsCapture:
             self.frame_handler(frame, internal_capture_control)
 
         else:
-            raise Exception("on_frame_arrived Event Handler Is Not Set")
+            raise RuntimeError("on_frame_arrived Event Handler Is Not Set")
 
     def on_closed(self) -> None:
         """This Method Is Called Before The on_closed Callback Function"""
         if self.closed_handler:
             self.closed_handler()
         else:
-            raise Exception("on_closed Event Handler Is Not Set")
+            raise RuntimeError("on_closed Event Handler Is Not Set")
 
     def event(self, handler: types.FunctionType) -> types.FunctionType:
         """Overrides The Callback Function"""
@@ -293,7 +299,7 @@ class WindowsCapture:
         elif handler.__name__ == "on_closed":
             self.closed_handler = handler
         else:
-            raise Exception("Invalid Event Handler Use on_frame_arrived Or on_closed")
+            raise ValueError("Invalid Event Handler Use on_frame_arrived Or on_closed")
         return handler
 
 
@@ -304,7 +310,7 @@ class DxgiDuplicationFrame:
 
     def __init__(self, native_frame: NativeMappedFrame) -> None:
         self._native = native_frame
-        self._numpy_cache: Optional[numpy.ndarray] = None
+        self._numpy_cache: numpy.ndarray | None = None
 
     @property
     def width(self) -> int:
@@ -382,17 +388,17 @@ class DxgiDuplicationFrame:
 class DxgiDuplicationSession:
     """High-level helper for DXGI desktop duplication captures."""
 
-    __slots__ = ("_native", "_monitor_index")
+    __slots__ = ("_monitor_index", "_native")
 
-    def __init__(self, monitor_index: Optional[int] = None) -> None:
+    def __init__(self, monitor_index: int | None = None) -> None:
         self._native = NativeDxgiDuplication(monitor_index)
         self._monitor_index = monitor_index
 
     @property
-    def monitor_index(self) -> Optional[int]:
+    def monitor_index(self) -> int | None:
         return self._monitor_index
 
-    def acquire_frame(self, timeout_ms: int = 16) -> Optional[DxgiDuplicationFrame]:
+    def acquire_frame(self, timeout_ms: int = 16) -> DxgiDuplicationFrame | None:
         native_frame = self._native.acquire_next_frame(timeout_ms)
         if native_frame is None:
             return None

@@ -67,10 +67,9 @@ def on_closed():
 capture.start()
 ```
 
-`Frame.frame_buffer` is a zero-copy NumPy view backed by an owned mapped D3D staging texture. It is
-safe to retain after the callback returns or the capture stops. Retaining it also keeps that staging
-texture mapped; for long-term storage, use `frame.frame_buffer.copy()` so the native resource can be
-released.
+`minimum_update_interval` optionally requests a minimum interval between eligible Graphics Capture
+updates, in milliseconds. It limits the update rate but does not guarantee a constant frame rate;
+`None` leaves the Windows setting unchanged.
 
 ### DXGI Desktop Duplication API
 
@@ -94,8 +93,6 @@ try:
 except RuntimeError:
     session.recreate()
 ```
-
-`DxgiDuplicationFrame.to_numpy()` has the same native-backed lifetime behavior.
 
 ## Benchmark
 
