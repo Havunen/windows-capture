@@ -9,7 +9,7 @@
 [Sponsors]: https://img.shields.io/github/sponsors/NiiightmareXD
 [Sponsors URL]: https://github.com/sponsors/NiiightmareXD
 
-## 🎉 Windows Capture 2.0.0 is here! 🚀
+## 🎉 Windows Capture 2.0.1 is here! 🚀
 
 - 🎬 Enhanced video encoder: hardware-accelerated with improved stability and monotonic audio timing
 - 🖥️ New support for the DXGI Desktop Duplication API
@@ -39,7 +39,7 @@ Add this dependency to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-windows-capture = "2.0.0"
+windows-capture = "2.0.1"
 ```
 
 Or run this command:
