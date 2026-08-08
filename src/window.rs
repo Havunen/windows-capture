@@ -21,7 +21,7 @@ use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromWindow};
 use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
-use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -268,12 +268,6 @@ impl Window {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         if !unsafe { IsWindowVisible(self.window).as_bool() } {
-            return false;
-        }
-
-        let mut id = 0;
-        unsafe { GetWindowThreadProcessId(self.window, Some(&mut id)) };
-        if id == unsafe { GetCurrentProcessId() } {
             return false;
         }
 

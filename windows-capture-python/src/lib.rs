@@ -250,16 +250,16 @@ impl NativeWindowsCapture {
         })
     }
 
-    /// Start capture.
+    /// Start capture, detaching the GIL while the native capture loop blocks.
     #[inline]
-    pub fn start(&mut self) -> PyResult<()> {
+    pub fn start(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(hwnd) = self.window_hwnd {
             // Capture by window handle (HWND)
             let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
 
             let settings = self.capture_settings(window);
 
-            match InnerNativeWindowsCapture::start(settings) {
+            match py.detach(move || InnerNativeWindowsCapture::start(settings)) {
                 Ok(()) => (),
                 Err(e) => {
                     return Err(PyException::new_err(format!(
@@ -278,7 +278,7 @@ impl NativeWindowsCapture {
 
             let settings = self.capture_settings(window);
 
-            match InnerNativeWindowsCapture::start(settings) {
+            match py.detach(move || InnerNativeWindowsCapture::start(settings)) {
                 Ok(()) => (),
                 Err(e) => {
                     return Err(PyException::new_err(format!(
@@ -297,7 +297,7 @@ impl NativeWindowsCapture {
 
             let settings = self.capture_settings(monitor);
 
-            match InnerNativeWindowsCapture::start(settings) {
+            match py.detach(move || InnerNativeWindowsCapture::start(settings)) {
                 Ok(()) => (),
                 Err(e) => {
                     return Err(PyException::new_err(format!(
@@ -310,16 +310,16 @@ impl NativeWindowsCapture {
         Ok(())
     }
 
-    /// Start capture on a dedicated thread.
+    /// Start capture on a dedicated thread, detaching the GIL during its startup handshake.
     #[inline]
-    pub fn start_free_threaded(&mut self) -> PyResult<NativeCaptureControl> {
+    pub fn start_free_threaded(&mut self, py: Python<'_>) -> PyResult<NativeCaptureControl> {
         let capture_control = if let Some(hwnd) = self.window_hwnd {
             // Capture by window handle (HWND)
             let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
 
             let settings = self.capture_settings(window);
 
-            let capture_control = match InnerNativeWindowsCapture::start_free_threaded(settings) {
+            let capture_control = match py.detach(move || InnerNativeWindowsCapture::start_free_threaded(settings)) {
                 Ok(capture_control) => capture_control,
                 Err(e) => {
                     if let GraphicsCaptureApiError::FrameHandlerError(InnerNativeWindowsCaptureError::PythonError(
@@ -345,7 +345,7 @@ impl NativeWindowsCapture {
 
             let settings = self.capture_settings(window);
 
-            let capture_control = match InnerNativeWindowsCapture::start_free_threaded(settings) {
+            let capture_control = match py.detach(move || InnerNativeWindowsCapture::start_free_threaded(settings)) {
                 Ok(capture_control) => capture_control,
                 Err(e) => {
                     if let GraphicsCaptureApiError::FrameHandlerError(InnerNativeWindowsCaptureError::PythonError(
@@ -371,7 +371,7 @@ impl NativeWindowsCapture {
 
             let settings = self.capture_settings(monitor);
 
-            let capture_control = match InnerNativeWindowsCapture::start_free_threaded(settings) {
+            let capture_control = match py.detach(move || InnerNativeWindowsCapture::start_free_threaded(settings)) {
                 Ok(capture_control) => capture_control,
                 Err(e) => {
                     if let GraphicsCaptureApiError::FrameHandlerError(InnerNativeWindowsCaptureError::PythonError(

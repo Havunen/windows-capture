@@ -22,7 +22,7 @@ class Frame:
     Attributes
     ----------
     frame_buffer : numpy.ndarray
-        Raw Buffer Of The Frame
+        Owned Raw Buffer Of The Frame
     width : str
         Width Of The Frame
     height : int
@@ -261,23 +261,18 @@ class WindowsCapture:
         if self.frame_handler:
             internal_capture_control = InternalCaptureControl(stop_list)
 
-            row_pitch = int(buf_len / height)
-            if row_pitch == width * 4:
-                ndarray = numpy.ctypeslib.as_array(
-                    ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)),
-                    shape=(height, width, 4),
-                )
-
-                frame = Frame(ndarray, width, height, timespan)
-                self.frame_handler(frame, internal_capture_control)
-            else:
-                ndarray = numpy.ctypeslib.as_array(
+            row_pitch = buf_len // height
+            ndarray = (
+                numpy.ctypeslib.as_array(
                     ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)),
                     shape=(height, row_pitch),
-                )[:, : width * 4].reshape(height, width, 4)
+                )[:, : width * 4]
+                .reshape(height, width, 4)
+                .copy()
+            )
 
-                frame = Frame(ndarray, width, height, timespan)
-                self.frame_handler(frame, internal_capture_control)
+            frame = Frame(ndarray, width, height, timespan)
+            self.frame_handler(frame, internal_capture_control)
 
         else:
             raise Exception("on_frame_arrived Event Handler Is Not Set")
