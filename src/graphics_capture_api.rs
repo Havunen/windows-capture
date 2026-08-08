@@ -243,6 +243,23 @@ impl GraphicsCaptureApi {
                 // Get frame content size
                 let frame_content_size = frame.ContentSize()?;
 
+                // Recreate the pool when the capture content changes size. The current frame's
+                // surface still has the old pool dimensions, so release it and wait for a frame
+                // backed by a correctly sized surface before invoking the callback.
+                if frame_content_size.Width != last_size.0.load(atomic::Ordering::Relaxed)
+                    || frame_content_size.Height != last_size.1.load(atomic::Ordering::Relaxed)
+                {
+                    drop(frame);
+
+                    let direct3d_device_recreate = &direct3d_device_recreate;
+                    frame_pool_recreate.Recreate(&direct3d_device_recreate.0, pixel_format, 1, frame_content_size)?;
+
+                    last_size.0.store(frame_content_size.Width, atomic::Ordering::Relaxed);
+                    last_size.1.store(frame_content_size.Height, atomic::Ordering::Relaxed);
+
+                    return Ok(());
+                }
+
                 // Get frame surface
                 let frame_surface = frame.Surface()?;
 
@@ -253,17 +270,6 @@ impl GraphicsCaptureApi {
                 // Get texture settings
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 unsafe { frame_texture.GetDesc(&mut desc) }
-
-                // Check if the size has been changed
-                if frame_content_size.Width != last_size.0.load(atomic::Ordering::Relaxed)
-                    || frame_content_size.Height != last_size.1.load(atomic::Ordering::Relaxed)
-                {
-                    let direct3d_device_recreate = &direct3d_device_recreate;
-                    frame_pool_recreate.Recreate(&direct3d_device_recreate.0, pixel_format, 1, frame_content_size)?;
-
-                    last_size.0.store(frame_content_size.Width, atomic::Ordering::Relaxed);
-                    last_size.1.store(frame_content_size.Height, atomic::Ordering::Relaxed);
-                }
 
                 // Create a frame
                 let mut frame = Frame::new(

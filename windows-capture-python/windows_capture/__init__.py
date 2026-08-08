@@ -5,8 +5,8 @@ from .windows_capture import (
     NativeCaptureControl,
     NativeDxgiDuplication,
     NativeDxgiDuplicationFrame,
+    NativeMappedFrame,
 )
-import ctypes
 import numpy
 import cv2
 import types
@@ -22,8 +22,8 @@ class Frame:
     Attributes
     ----------
     frame_buffer : numpy.ndarray
-        Owned Raw Buffer Of The Frame
-    width : str
+        Zero-copy view backed by an owned native mapped frame
+    width : int
         Width Of The Frame
     height : int
         Height Of The Frame
@@ -154,7 +154,7 @@ class WindowsCapture:
     start_free_threaded():
         Starts The Capture Thread On A Dedicated Thread
     on_frame_arrived(
-        buf : ctypes.POINTER,
+        native_frame : NativeMappedFrame,
         buf_len : int,
         width : int,
         height : int,
@@ -249,7 +249,7 @@ class WindowsCapture:
 
     def on_frame_arrived(
         self,
-        buf: ctypes.POINTER,
+        native_frame: NativeMappedFrame,
         buf_len: int,
         width: int,
         height: int,
@@ -261,15 +261,17 @@ class WindowsCapture:
         if self.frame_handler:
             internal_capture_control = InternalCaptureControl(stop_list)
 
-            row_pitch = buf_len // height
-            ndarray = (
-                numpy.ctypeslib.as_array(
-                    ctypes.cast(buf, ctypes.POINTER(ctypes.c_uint8)),
-                    shape=(height, row_pitch),
-                )[:, : width * 4]
-                .reshape(height, width, 4)
-                .copy()
-            )
+            row_pitch = int(native_frame.bytes_per_row)
+            expected_len = row_pitch * height
+            if buf_len != expected_len:
+                raise RuntimeError(
+                    f"Mapped frame length {buf_len} does not match {expected_len}"
+                )
+
+            raw_buffer = numpy.frombuffer(
+                native_frame.buffer_view(), dtype=numpy.uint8, count=buf_len
+            ).reshape(height, row_pitch)
+            ndarray = raw_buffer[:, : width * 4].reshape(height, width, 4)
 
             frame = Frame(ndarray, width, height, timespan)
             self.frame_handler(frame, internal_capture_control)
@@ -300,7 +302,7 @@ class DxgiDuplicationFrame:
 
     __slots__ = ("_native", "_numpy_cache")
 
-    def __init__(self, native_frame: NativeDxgiDuplicationFrame) -> None:
+    def __init__(self, native_frame: NativeMappedFrame) -> None:
         self._native = native_frame
         self._numpy_cache: Optional[numpy.ndarray] = None
 
@@ -329,15 +331,16 @@ class DxgiDuplicationFrame:
         raw = numpy.frombuffer(memory_view, dtype=numpy.uint8)
         return raw.reshape(self.height, self.bytes_per_row)
 
-    def to_numpy(self, *, copy: bool = False) -> numpy.ndarray:
+    def to_numpy(self) -> numpy.ndarray:
         """Returns the frame as a ``numpy.ndarray`` with shape ``(height, width, 4)``.
 
         The channel order matches the underlying capture format (BGRA or RGBA).
         For ``rgba16f`` frames the returned dtype is ``numpy.float16``; otherwise
-        ``numpy.uint8`` is used.
+        ``numpy.uint8`` is used. The array retains the native mapped frame that
+        owns its backing memory.
         """
 
-        if self._numpy_cache is not None and not copy:
+        if self._numpy_cache is not None:
             return self._numpy_cache
 
         raw = self._raw_buffer()[:, : self.width * self.bytes_per_pixel]
@@ -347,22 +350,19 @@ class DxgiDuplicationFrame:
         else:
             frame = raw.reshape((self.height, self.width, 4))
 
-        if copy:
-            return frame.copy()
-
         self._numpy_cache = frame
         return frame
 
-    def to_bgr(self, *, copy: bool = True) -> numpy.ndarray:
+    def to_bgr(self) -> numpy.ndarray:
         """Returns the frame converted to BGR ``numpy.uint8`` format."""
 
-        image = self.to_numpy(copy=copy)
+        image = self.to_numpy()
 
         if self.color_format == "bgra8":
-            return image[..., :3].copy() if copy else image[..., :3]
+            return image[..., :3]
 
         if self.color_format == "rgba8":
-            return image[..., 2::-1] if not copy else image[..., [2, 1, 0]].copy()
+            return image[..., 2::-1]
 
         # rgba16f -> convert to 0..255 range before casting
         normalized = numpy.clip(image.astype(numpy.float32), 0.0, 1.0)
@@ -371,12 +371,7 @@ class DxgiDuplicationFrame:
     def save_as_image(self, path: str) -> None:
         """Saves the frame to disk using OpenCV."""
 
-        if self.color_format == "rgba16f":
-            bgr = self.to_bgr(copy=True)
-        else:
-            bgr = self.to_bgr(copy=False)
-
-        cv2.imwrite(path, bgr)
+        cv2.imwrite(path, self.to_bgr())
 
     def to_bytes(self) -> bytes:
         """Returns a contiguous copy of the frame bytes."""

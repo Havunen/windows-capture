@@ -67,6 +67,11 @@ def on_closed():
 capture.start()
 ```
 
+`Frame.frame_buffer` is a zero-copy NumPy view backed by an owned mapped D3D staging texture. It is
+safe to retain after the callback returns or the capture stops. Retaining it also keeps that staging
+texture mapped; for long-term storage, use `frame.frame_buffer.copy()` so the native resource can be
+released.
+
 ### DXGI Desktop Duplication API
 
 ```python
@@ -78,7 +83,7 @@ session = DxgiDuplicationSession()
 # Grab a frame (returns None if no frame is available within the timeout)
 frame = session.acquire_frame(timeout_ms=33)
 if frame is not None:
-    image = frame.to_numpy(copy=False)  # shape: (height, width, 4)
+    image = frame.to_numpy()  # shape: (height, width, 4)
 
     # Save as PNG using OpenCV
     frame.save_as_image("duplication.png")
@@ -89,6 +94,8 @@ try:
 except RuntimeError:
     session.recreate()
 ```
+
+`DxgiDuplicationFrame.to_numpy()` has the same native-backed lifetime behavior.
 
 ## Benchmark
 

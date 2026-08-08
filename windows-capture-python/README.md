@@ -78,7 +78,7 @@ session = DxgiDuplicationSession()
 # Grab a frame (returns None if no frame is available within the timeout)
 frame = session.acquire_frame(timeout_ms=33)
 if frame is not None:
-    image = frame.to_numpy(copy=False)  # shape: (height, width, 4)
+    image = frame.to_numpy()  # shape: (height, width, 4)
 
     # Save as PNG using OpenCV
     frame.save_as_image("duplication.png")

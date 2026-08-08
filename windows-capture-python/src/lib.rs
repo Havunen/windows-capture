@@ -3,16 +3,16 @@
 #![allow(clippy::redundant_pub_crate)]
 #![allow(clippy::multiple_crate_versions)] // Should update as soon as possible
 
-use std::os::raw::{c_char, c_int};
-use std::sync::Arc;
+use std::slice;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use std::{ptr, slice};
 
 use ::windows_capture::capture::{
     CaptureControl, CaptureControlError, Context, GraphicsCaptureApiError, GraphicsCaptureApiHandler,
 };
+use ::windows_capture::d3d11::{self, StagingTexture};
 use ::windows_capture::dxgi_duplication_api::{DxgiDuplicationApi, Error as DxgiDuplicationError};
-use ::windows_capture::frame::{self, Frame};
+use ::windows_capture::frame::Frame;
 use ::windows_capture::graphics_capture_api::InternalCaptureControl;
 use ::windows_capture::monitor::Monitor;
 use ::windows_capture::settings::{
@@ -21,16 +21,13 @@ use ::windows_capture::settings::{
 };
 use ::windows_capture::window::Window;
 use pyo3::exceptions::PyException;
-use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyMemoryView};
+use pyo3::types::{PyList, PyMemoryView, PyModule};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-    ID3D11Texture2D,
+    D3D11_MAP_READ_WRITE, D3D11_MAPPED_SUBRESOURCE, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_SAMPLE_DESC,
 };
 
 type PythonCaptureCallbacks = (Arc<Py<PyAny>>, Arc<Py<PyAny>>);
@@ -41,7 +38,8 @@ fn windows_capture(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeWindowsCapture>()?;
     m.add_class::<NativeCaptureControl>()?;
     m.add_class::<NativeDxgiDuplication>()?;
-    m.add_class::<NativeDxgiDuplicationFrame>()?;
+    m.add_class::<NativeMappedFrame>()?;
+    m.add("NativeDxgiDuplicationFrame", m.getattr("NativeMappedFrame")?)?;
     Ok(())
 }
 
@@ -392,17 +390,197 @@ impl NativeWindowsCapture {
     }
 }
 
+type SharedDeviceContext = Arc<Mutex<ID3D11DeviceContext>>;
+
+fn lock_device_context(context: &SharedDeviceContext) -> MutexGuard<'_, ID3D11DeviceContext> {
+    context.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+const fn color_format_to_str(color_format: ColorFormat) -> &'static str {
+    match color_format {
+        ColorFormat::Bgra8 => "bgra8",
+        ColorFormat::Rgba8 => "rgba8",
+        ColorFormat::Rgba16F => "rgba16f",
+    }
+}
+
+const fn bytes_per_pixel(color_format: ColorFormat) -> usize {
+    match color_format {
+        ColorFormat::Bgra8 | ColorFormat::Rgba8 => 4,
+        ColorFormat::Rgba16F => 8,
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum NativeMappedFrameError {
+    #[error("Failed to create a staging texture: {0}")]
+    StagingTexture(#[from] d3d11::Error),
+    #[error("Failed to map the staging texture: {0}")]
+    Map(#[source] windows::core::Error),
+    #[error("The mapped staging texture returned a null data pointer")]
+    NullDataPointer,
+    #[error("The mapped frame size overflowed usize")]
+    SizeOverflow,
+}
+
+/// Owns a mapped D3D staging texture for as long as Python retains its buffer view.
+#[pyclass]
+pub struct NativeMappedFrame {
+    context: SharedDeviceContext,
+    staging: StagingTexture,
+    ptr: usize,
+    len: usize,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: usize,
+    row_pitch: usize,
+    color_format: &'static str,
+}
+
+impl NativeMappedFrame {
+    fn map_texture(
+        device: &ID3D11Device,
+        context: SharedDeviceContext,
+        texture: &ID3D11Texture2D,
+        width: u32,
+        height: u32,
+        format: DXGI_FORMAT,
+        color_format: ColorFormat,
+    ) -> Result<Self, NativeMappedFrameError> {
+        let mut staging = StagingTexture::new(device, width, height, format)?;
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+
+        {
+            let context_guard = lock_device_context(&context);
+            unsafe {
+                context_guard.CopyResource(staging.texture(), texture);
+                context_guard
+                    .Map(staging.texture(), 0, D3D11_MAP_READ_WRITE, 0, Some(&mut mapped))
+                    .map_err(NativeMappedFrameError::Map)?;
+            }
+        }
+
+        staging.set_mapped(true);
+
+        let mut frame = Self {
+            context,
+            staging,
+            ptr: mapped.pData as usize,
+            len: 0,
+            width,
+            height,
+            bytes_per_pixel: bytes_per_pixel(color_format),
+            row_pitch: mapped.RowPitch as usize,
+            color_format: color_format_to_str(color_format),
+        };
+
+        if frame.ptr == 0 {
+            return Err(NativeMappedFrameError::NullDataPointer);
+        }
+
+        frame.len = frame
+            .row_pitch
+            .checked_mul(usize::try_from(height).map_err(|_| NativeMappedFrameError::SizeOverflow)?)
+            .ok_or(NativeMappedFrameError::SizeOverflow)?;
+
+        Ok(frame)
+    }
+}
+
+impl Drop for NativeMappedFrame {
+    fn drop(&mut self) {
+        if self.staging.is_mapped() {
+            let context = Arc::clone(&self.context);
+            let context_guard = lock_device_context(&context);
+            unsafe {
+                context_guard.Unmap(self.staging.texture(), 0);
+            }
+            drop(context_guard);
+
+            self.staging.set_mapped(false);
+            self.ptr = 0;
+            self.len = 0;
+        }
+    }
+}
+
+#[pymethods]
+#[allow(clippy::missing_const_for_fn)]
+impl NativeMappedFrame {
+    #[getter]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[getter]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    #[getter]
+    pub fn bytes_per_pixel(&self) -> usize {
+        self.bytes_per_pixel
+    }
+
+    #[getter]
+    pub fn color_format(&self) -> &'static str {
+        self.color_format
+    }
+
+    #[getter]
+    pub fn bytes_per_row(&self) -> usize {
+        self.row_pitch
+    }
+
+    /// Returns the mapped pointer. It remains valid while this object or one of its buffer views exists.
+    pub fn buffer_ptr(&self) -> usize {
+        self.ptr
+    }
+
+    pub fn buffer_len(&self) -> usize {
+        self.len
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        unsafe { slice::from_raw_parts(self.ptr as *const u8, self.len) }.to_vec()
+    }
+
+    /// Creates a zero-copy memory view whose exporter retains this native owner.
+    pub fn buffer_view<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyMemoryView>> {
+        let (ptr, len) = {
+            let frame = slf.borrow();
+            (frame.ptr, frame.len)
+        };
+
+        if ptr == 0 {
+            return Err(PyException::new_err("The mapped frame has already been released"));
+        }
+
+        let py = slf.py();
+        // `abi3-py39` cannot install custom buffer slots through PyO3. A ctypes array is a
+        // stable-ABI buffer exporter, and its owner attribute keeps this mapped frame alive for
+        // every memoryview and NumPy view derived from it.
+        let ctypes = PyModule::import(py, "ctypes")?;
+        let buffer_type = ctypes.getattr("ARRAY")?.call1((ctypes.getattr("c_ubyte")?, len))?;
+        let buffer = buffer_type.call_method1("from_address", (ptr,))?;
+        buffer.setattr("_windows_capture_owner", slf.as_any())?;
+
+        PyMemoryView::from(&buffer)
+    }
+}
+
 struct InnerNativeWindowsCapture {
     on_frame_arrived_callback: Arc<Py<PyAny>>,
     on_closed: Arc<Py<PyAny>>,
+    context: Option<SharedDeviceContext>,
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum InnerNativeWindowsCaptureError {
     #[error("Python callback error: {0}")]
     PythonError(pyo3::PyErr),
-    #[error("Frame process error: {0}")]
-    FrameProcessError(frame::Error),
+    #[error("Mapped frame error: {0}")]
+    MappedFrameError(#[from] NativeMappedFrameError),
     #[error("Windows API error: {0}")]
     WindowsApiError(windows::core::Error),
 }
@@ -413,7 +591,7 @@ impl GraphicsCaptureApiHandler for InnerNativeWindowsCapture {
 
     #[inline]
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self { on_frame_arrived_callback: ctx.flags.0, on_closed: ctx.flags.1 })
+        Ok(Self { on_frame_arrived_callback: ctx.flags.0, on_closed: ctx.flags.1, context: None })
     }
 
     #[inline]
@@ -425,15 +603,25 @@ impl GraphicsCaptureApiHandler for InnerNativeWindowsCapture {
         let width = frame.width();
         let height = frame.height();
         let timestamp = frame.timestamp().map_err(InnerNativeWindowsCaptureError::WindowsApiError)?.Duration;
-        let mut buffer = frame.buffer().map_err(InnerNativeWindowsCaptureError::FrameProcessError)?;
-        let buffer = buffer.as_raw_buffer();
+        let context = self.context.get_or_insert_with(|| Arc::new(Mutex::new(frame.device_context().clone()))).clone();
+        let mapped_frame = NativeMappedFrame::map_texture(
+            frame.device(),
+            context,
+            frame.as_raw_texture(),
+            width,
+            height,
+            frame.desc().Format,
+            frame.color_format(),
+        )?;
+        let buffer_len = mapped_frame.len;
 
         Python::attach(|py| -> Result<(), Self::Error> {
             py.check_signals().map_err(InnerNativeWindowsCaptureError::PythonError)?;
 
             let stop_list = PyList::new(py, [false]).map_err(InnerNativeWindowsCaptureError::PythonError)?;
+            let mapped_frame = Py::new(py, mapped_frame).map_err(InnerNativeWindowsCaptureError::PythonError)?;
             self.on_frame_arrived_callback
-                .call1(py, (buffer.as_ptr() as isize, buffer.len(), width, height, stop_list.clone(), timestamp))
+                .call1(py, (mapped_frame, buffer_len, width, height, stop_list.clone(), timestamp))
                 .map_err(InnerNativeWindowsCaptureError::PythonError)?;
 
             if stop_list
@@ -463,34 +651,22 @@ impl GraphicsCaptureApiHandler for InnerNativeWindowsCapture {
 pub struct NativeDxgiDuplication {
     duplication: DxgiDuplicationApi,
     monitor: Monitor,
+    context: SharedDeviceContext,
 }
 
 impl NativeDxgiDuplication {
-    fn new_duplication(monitor: Monitor) -> Result<(Monitor, DxgiDuplicationApi), DxgiDuplicationError> {
+    fn new_duplication(monitor: Monitor) -> Result<(DxgiDuplicationApi, SharedDeviceContext), DxgiDuplicationError> {
         let duplication = DxgiDuplicationApi::new(monitor)?;
+        let context = Arc::new(Mutex::new(duplication.device_context().clone()));
 
-        Ok((monitor, duplication))
+        Ok((duplication, context))
     }
 
     fn recreate_duplication(&mut self) -> Result<(), DxgiDuplicationError> {
-        let (_, duplication) = Self::new_duplication(self.monitor)?;
+        let (duplication, context) = Self::new_duplication(self.monitor)?;
         self.duplication = duplication;
+        self.context = context;
         Ok(())
-    }
-
-    const fn color_format_to_str(color_format: ColorFormat) -> &'static str {
-        match color_format {
-            ColorFormat::Bgra8 => "bgra8",
-            ColorFormat::Rgba8 => "rgba8",
-            ColorFormat::Rgba16F => "rgba16f",
-        }
-    }
-
-    const fn bytes_per_pixel(color_format: ColorFormat) -> usize {
-        match color_format {
-            ColorFormat::Bgra8 | ColorFormat::Rgba8 => 4,
-            ColorFormat::Rgba16F => 8,
-        }
     }
 
     fn color_format_from_dxgi(format: DXGI_FORMAT) -> PyResult<ColorFormat> {
@@ -515,71 +691,30 @@ impl NativeDxgiDuplication {
                 .map_err(|e| PyException::new_err(format!("Failed to acquire primary monitor: {e}",)))?,
         };
 
-        let (_, duplication) = Self::new_duplication(monitor)
+        let (duplication, context) = Self::new_duplication(monitor)
             .map_err(|e| PyException::new_err(format!("Failed to create DXGI duplication session: {e}")))?;
 
-        Ok(Self { duplication, monitor })
+        Ok(Self { duplication, monitor, context })
     }
 
     #[pyo3(signature = (timeout_ms=16))]
-    pub fn acquire_next_frame(&mut self, timeout_ms: u32) -> PyResult<Option<NativeDxgiDuplicationFrame>> {
+    pub fn acquire_next_frame(&mut self, timeout_ms: u32) -> PyResult<Option<NativeMappedFrame>> {
         match self.duplication.acquire_next_frame(timeout_ms) {
             Ok(frame) => {
                 let texture_desc = *frame.texture_desc();
                 let width = texture_desc.Width;
                 let height = texture_desc.Height;
                 let color_format = Self::color_format_from_dxgi(texture_desc.Format)?;
-                let bytes_per_pixel = Self::bytes_per_pixel(color_format);
-
-                let staging_desc = D3D11_TEXTURE2D_DESC {
-                    Width: width,
-                    Height: height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: texture_desc.Format,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Usage: D3D11_USAGE_STAGING,
-                    BindFlags: 0,
-                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                    MiscFlags: 0,
-                };
-
-                let device_context = frame.device_context().clone();
-                let device = frame.device().clone();
-
-                let mut staging = None;
-                unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }
-                    .map_err(|e| PyException::new_err(format!("Failed to create staging texture: {e}")))?;
-                let staging = staging.expect("CreateTexture2D returned Ok but no texture");
-
-                unsafe {
-                    device_context.CopyResource(&staging, frame.texture());
-                }
-
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                unsafe { device_context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-                    .map_err(|e| PyException::new_err(format!("Failed to map duplication frame: {e}")))?;
-
-                let row_pitch_u32 = mapped.RowPitch;
-                let row_pitch = usize::try_from(row_pitch_u32)
-                    .map_err(|_| PyException::new_err("Failed to convert row pitch to usize"))?;
-                let height_usize =
-                    usize::try_from(height).map_err(|_| PyException::new_err("Failed to convert height to usize"))?;
-                let len = row_pitch
-                    .checked_mul(height_usize)
-                    .ok_or_else(|| PyException::new_err("Mapped frame size overflowed usize"))?;
-
-                let frame_obj = NativeDxgiDuplicationFrame::new(
-                    device_context,
-                    staging,
-                    mapped.pData.cast::<u8>(),
-                    len,
+                let frame_obj = NativeMappedFrame::map_texture(
+                    frame.device(),
+                    Arc::clone(&self.context),
+                    frame.texture(),
                     width,
                     height,
-                    bytes_per_pixel,
-                    row_pitch,
-                    Self::color_format_to_str(color_format),
-                );
+                    texture_desc.Format,
+                    color_format,
+                )
+                .map_err(|e| PyException::new_err(format!("Failed to map duplication frame: {e}")))?;
 
                 Ok(Some(frame_obj))
             }
@@ -596,11 +731,12 @@ impl NativeDxgiDuplication {
         let monitor = Monitor::from_index(monitor_index)
             .map_err(|e| PyException::new_err(format!("Failed to resolve monitor from index {monitor_index}: {e}")))?;
 
-        let (_, duplication) = Self::new_duplication(monitor)
+        let (duplication, context) = Self::new_duplication(monitor)
             .map_err(|e| PyException::new_err(format!("Failed to create DXGI duplication session: {e}")))?;
 
         self.monitor = monitor;
         self.duplication = duplication;
+        self.context = context;
 
         Ok(())
     }
@@ -609,103 +745,5 @@ impl NativeDxgiDuplication {
         self.recreate_duplication()
             .map_err(|e| PyException::new_err(format!("Failed to recreate DXGI duplication session: {e}")))?;
         Ok(())
-    }
-}
-
-#[pyclass(unsendable)]
-pub struct NativeDxgiDuplicationFrame {
-    context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-    staging: ID3D11Texture2D,
-    ptr: *mut u8,
-    len: usize,
-    width: u32,
-    height: u32,
-    bytes_per_pixel: usize,
-    row_pitch: usize,
-    color_format: &'static str,
-    mapped: bool,
-}
-
-#[allow(clippy::missing_const_for_fn)]
-impl NativeDxgiDuplicationFrame {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-        staging: ID3D11Texture2D,
-        ptr: *mut u8,
-        len: usize,
-        width: u32,
-        height: u32,
-        bytes_per_pixel: usize,
-        row_pitch: usize,
-        color_format: &'static str,
-    ) -> Self {
-        Self { context, staging, ptr, len, width, height, bytes_per_pixel, row_pitch, color_format, mapped: true }
-    }
-}
-
-impl Drop for NativeDxgiDuplicationFrame {
-    fn drop(&mut self) {
-        if self.mapped {
-            unsafe {
-                self.context.Unmap(&self.staging, 0);
-            }
-            self.mapped = false;
-            self.ptr = ptr::null_mut();
-            self.len = 0;
-        }
-    }
-}
-
-#[pymethods]
-#[allow(clippy::missing_const_for_fn)]
-impl NativeDxgiDuplicationFrame {
-    #[getter]
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    #[getter]
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    #[getter]
-    pub fn bytes_per_pixel(&self) -> usize {
-        self.bytes_per_pixel
-    }
-
-    #[getter]
-    pub fn color_format(&self) -> &'static str {
-        self.color_format
-    }
-
-    #[getter]
-    pub fn bytes_per_row(&self) -> usize {
-        self.row_pitch
-    }
-
-    pub fn buffer_ptr(&self) -> usize {
-        self.ptr as usize
-    }
-
-    pub fn buffer_len(&self) -> usize {
-        self.len
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        unsafe { slice::from_raw_parts(self.ptr, self.len) }.to_vec()
-    }
-
-    pub fn buffer_view<'py>(&'py self, py: Python<'py>) -> PyResult<Bound<'py, PyMemoryView>> {
-        let len = isize::try_from(self.len).map_err(|_| PyException::new_err("Frame too large for memoryview"))?;
-        const PYBUF_READ: c_int = 0x100;
-        let view = unsafe { ffi::PyMemoryView_FromMemory(self.ptr.cast::<c_char>(), len, PYBUF_READ) };
-        if view.is_null() {
-            Err(PyException::new_err("Failed to create memoryview for DXGI frame"))
-        } else {
-            let any = unsafe { Bound::from_owned_ptr(py, view) };
-            any.cast_into().map_err(|e| e.into())
-        }
     }
 }
