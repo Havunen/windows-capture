@@ -182,6 +182,32 @@ impl DxgiDuplicationApi {
         }
     }
 
+    fn recreate_with_formats(mut self, supported_formats: &[DXGI_FORMAT]) -> Result<Self, Error> {
+        let _ = self.release_frame_if_needed();
+
+        // Keep the device/output alive, but release the existing duplication interface before
+        // asking DXGI for its replacement. `DuplicateOutput1` may reject a second live
+        // duplication for the same output.
+        let d3d_device = self.d3d_device.clone();
+        let d3d_device_context = self.d3d_device_context.clone();
+        let dxgi_device = self.dxgi_device.clone();
+        let output = self.output.clone();
+        drop(self);
+
+        let duplication = unsafe { output.DuplicateOutput1(&d3d_device, 0, supported_formats)? };
+        let duplication_desc = unsafe { duplication.GetDesc() };
+
+        Ok(Self {
+            d3d_device,
+            d3d_device_context,
+            duplication,
+            duplication_desc,
+            dxgi_device,
+            output,
+            is_holding_frame: false,
+        })
+    }
+
     /// Constructs a new duplication session for the specified monitor.
     ///
     /// Internally creates a Direct3D 11 device and immediate context using the crate's d3d11
@@ -244,29 +270,16 @@ impl DxgiDuplicationApi {
 
     /// Recreates the duplication interface, mostly used after receiving an [`Error::AccessLost`]
     /// error from [`DxgiDuplicationApi::acquire_next_frame`].
-    pub fn recreate(mut self) -> Result<Self, Error> {
-        let _ = self.release_frame_if_needed();
-
-        self.duplication = unsafe { self.output.DuplicateOutput1(&self.d3d_device, 0, &DEFAULT_DUPLICATION_FORMATS)? };
-        self.duplication_desc = unsafe { self.duplication.GetDesc() };
-        self.is_holding_frame = false;
-
-        Ok(self)
+    pub fn recreate(self) -> Result<Self, Error> {
+        self.recreate_with_formats(&DEFAULT_DUPLICATION_FORMATS)
     }
 
     /// Recreates the duplication interface with a custom list of supported DXGI formats, mostly
     /// used after receiving an [`Error::AccessLost`] error from
     /// [`DxgiDuplicationApi::acquire_next_frame`].
-    pub fn recreate_options(mut self, supported_formats: &[DxgiDuplicationFormat]) -> Result<Self, Error> {
+    pub fn recreate_options(self, supported_formats: &[DxgiDuplicationFormat]) -> Result<Self, Error> {
         let supported_formats = map_supported_formats(supported_formats);
-
-        let _ = self.release_frame_if_needed();
-
-        self.duplication = unsafe { self.output.DuplicateOutput1(&self.d3d_device, 0, &supported_formats)? };
-        self.duplication_desc = unsafe { self.duplication.GetDesc() };
-        self.is_holding_frame = false;
-
-        Ok(self)
+        self.recreate_with_formats(&supported_formats)
     }
 
     /// Gets the underlying [`windows::Win32::Graphics::Direct3D11::ID3D11Device`] associated with

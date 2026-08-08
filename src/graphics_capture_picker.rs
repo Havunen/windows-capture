@@ -10,6 +10,7 @@ use windows::core::{Interface, w};
 use windows_future::AsyncStatus;
 
 use crate::settings::GraphicsCaptureItemType;
+use crate::winrt::WinRT;
 
 #[derive(thiserror::Error, Eq, PartialEq, Clone, Debug)]
 /// Errors that can occur while showing or interacting with the Graphics Capture Picker.
@@ -33,13 +34,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     }
 }
 
-/// RAII guard that destroys the hidden picker window on drop and drains any
-/// pending messages associated with it.
-pub struct HwndGuard(HWND);
+/// RAII guard that keeps the picker resources alive until the selected item is
+/// consumed.
+pub struct HwndGuard {
+    hwnd: HWND,
+    _winrt: WinRT,
+}
+
 impl Drop for HwndGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = DestroyWindow(self.0);
+            let _ = DestroyWindow(self.hwnd);
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 // We just remove them; no need to dispatch at this point.
@@ -84,6 +89,11 @@ impl GraphicsCapturePicker {
     /// - [`Error::Canceled`] when the user cancels the picker
     /// - [`Error::WindowsError`] for underlying Windows API failures
     pub fn pick_item() -> Result<Option<PickedGraphicsCaptureItem>, Error> {
+        // The picker and the item it returns must be created in an initialized
+        // WinRT apartment. Keep this guard with the item so Windows 10 does not
+        // disconnect it before capture starts.
+        let winrt = WinRT::new()?;
+
         let hinst = unsafe { GetModuleHandleW(None) }?;
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -118,9 +128,13 @@ impl GraphicsCapturePicker {
             )
         }?;
 
+        // Construct the guard immediately so the hidden window is also cleaned
+        // up when picker initialization, selection, or result retrieval fails.
+        let guard = HwndGuard { hwnd, _winrt: winrt };
+
         let picker = windows::Graphics::Capture::GraphicsCapturePicker::new()?;
         let initialize_with_window: IInitializeWithWindow = picker.cast()?;
-        unsafe { initialize_with_window.Initialize(hwnd) }?;
+        unsafe { initialize_with_window.Initialize(guard.hwnd) }?;
 
         let op = picker.PickSingleItemAsync()?;
 
@@ -143,7 +157,7 @@ impl GraphicsCapturePicker {
 
         op.GetResults()
             .ok()
-            .map_or_else(|| Ok(None), |item| Ok(Some(PickedGraphicsCaptureItem { item, _guard: HwndGuard(hwnd) })))
+            .map_or_else(|| Ok(None), |item| Ok(Some(PickedGraphicsCaptureItem { item, _guard: guard })))
     }
 }
 

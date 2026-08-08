@@ -399,6 +399,9 @@ class DxgiDuplicationSession:
         return self._monitor_index
 
     def acquire_frame(self, timeout_ms: int = 16) -> DxgiDuplicationFrame | None:
+        if self._native is None:
+            raise RuntimeError("DXGI duplication session is inactive; call recreate()")
+
         native_frame = self._native.acquire_next_frame(timeout_ms)
         if native_frame is None:
             return None
@@ -406,8 +409,10 @@ class DxgiDuplicationSession:
         return DxgiDuplicationFrame(native_frame)
 
     def recreate(self) -> None:
-        self._native.recreate()
+        self._native = None
+        self._native = NativeDxgiDuplication(self._monitor_index)
 
     def switch_monitor(self, monitor_index: int) -> None:
-        self._native.switch_monitor(monitor_index)
+        self._native = None
+        self._native = NativeDxgiDuplication(monitor_index)
         self._monitor_index = monitor_index

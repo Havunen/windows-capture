@@ -650,7 +650,6 @@ impl GraphicsCaptureApiHandler for InnerNativeWindowsCapture {
 #[pyclass(unsendable)]
 pub struct NativeDxgiDuplication {
     duplication: DxgiDuplicationApi,
-    monitor: Monitor,
     context: SharedDeviceContext,
 }
 
@@ -660,13 +659,6 @@ impl NativeDxgiDuplication {
         let context = Arc::new(Mutex::new(duplication.device_context().clone()));
 
         Ok((duplication, context))
-    }
-
-    fn recreate_duplication(&mut self) -> Result<(), DxgiDuplicationError> {
-        let (duplication, context) = Self::new_duplication(self.monitor)?;
-        self.duplication = duplication;
-        self.context = context;
-        Ok(())
     }
 
     fn color_format_from_dxgi(format: DXGI_FORMAT) -> PyResult<ColorFormat> {
@@ -694,7 +686,7 @@ impl NativeDxgiDuplication {
         let (duplication, context) = Self::new_duplication(monitor)
             .map_err(|e| PyException::new_err(format!("Failed to create DXGI duplication session: {e}")))?;
 
-        Ok(Self { duplication, monitor, context })
+        Ok(Self { duplication, context })
     }
 
     #[pyo3(signature = (timeout_ms=16))]
@@ -724,26 +716,5 @@ impl NativeDxgiDuplication {
             }
             Err(other) => Err(PyException::new_err(format!("Failed to acquire duplication frame: {other}"))),
         }
-    }
-
-    #[pyo3(signature = (monitor_index))]
-    pub fn switch_monitor(&mut self, monitor_index: usize) -> PyResult<()> {
-        let monitor = Monitor::from_index(monitor_index)
-            .map_err(|e| PyException::new_err(format!("Failed to resolve monitor from index {monitor_index}: {e}")))?;
-
-        let (duplication, context) = Self::new_duplication(monitor)
-            .map_err(|e| PyException::new_err(format!("Failed to create DXGI duplication session: {e}")))?;
-
-        self.monitor = monitor;
-        self.duplication = duplication;
-        self.context = context;
-
-        Ok(())
-    }
-
-    pub fn recreate(&mut self) -> PyResult<()> {
-        self.recreate_duplication()
-            .map_err(|e| PyException::new_err(format!("Failed to recreate DXGI duplication session: {e}")))?;
-        Ok(())
     }
 }
