@@ -165,6 +165,27 @@ impl<Flags, T: TryInto<GraphicsCaptureItemType>> Settings<Flags, T> {
         self.draw_border_settings
     }
 
+    /// Returns the secondary window settings.
+    #[inline]
+    #[must_use]
+    pub const fn secondary_window(&self) -> SecondaryWindowSettings {
+        self.secondary_window_settings
+    }
+
+    /// Returns the minimum update interval settings.
+    #[inline]
+    #[must_use]
+    pub const fn minimum_update_interval(&self) -> MinimumUpdateIntervalSettings {
+        self.minimum_update_interval_settings
+    }
+
+    /// Returns the dirty region settings.
+    #[inline]
+    #[must_use]
+    pub const fn dirty_region(&self) -> DirtyRegionSettings {
+        self.dirty_region_settings
+    }
+
     /// Returns the color format.
     #[inline]
     #[must_use]

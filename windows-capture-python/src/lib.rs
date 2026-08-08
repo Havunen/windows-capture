@@ -16,8 +16,8 @@ use ::windows_capture::frame::{self, Frame};
 use ::windows_capture::graphics_capture_api::InternalCaptureControl;
 use ::windows_capture::monitor::Monitor;
 use ::windows_capture::settings::{
-    ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings, MinimumUpdateIntervalSettings,
-    SecondaryWindowSettings, Settings,
+    ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings, GraphicsCaptureItemType,
+    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 use ::windows_capture::window::Window;
 use pyo3::exceptions::PyException;
@@ -32,6 +32,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
     DXGI_SAMPLE_DESC,
 };
+
+type PythonCaptureCallbacks = (Arc<Py<PyAny>>, Arc<Py<PyAny>>);
 
 /// Fastest Windows Screen Capture Library For Python 🔥.
 #[pymodule]
@@ -120,19 +122,54 @@ impl NativeCaptureControl {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphicsCaptureSessionOptions {
+    cursor_capture: CursorCaptureSettings,
+    draw_border: DrawBorderSettings,
+    secondary_window: SecondaryWindowSettings,
+    minimum_update_interval: MinimumUpdateIntervalSettings,
+    dirty_region: DirtyRegionSettings,
+}
+
+impl GraphicsCaptureSessionOptions {
+    #[inline]
+    const fn settings<Flags, T>(self, item: T, flags: Flags) -> Settings<Flags, T>
+    where
+        T: TryInto<GraphicsCaptureItemType>,
+    {
+        Settings::new(
+            item,
+            self.cursor_capture,
+            self.draw_border,
+            self.secondary_window,
+            self.minimum_update_interval,
+            self.dirty_region,
+            ColorFormat::Bgra8,
+            flags,
+        )
+    }
+}
+
 /// Internal struct used for Windows capture.
 #[pyclass]
 pub struct NativeWindowsCapture {
     on_frame_arrived_callback: Arc<Py<PyAny>>,
     on_closed: Arc<Py<PyAny>>,
-    cursor_capture: CursorCaptureSettings,
-    draw_border: DrawBorderSettings,
-    secondary_window: SecondaryWindowSettings,
-    minimum_update_interval: MinimumUpdateIntervalSettings,
-    dirty_region_settings: DirtyRegionSettings,
+    session_options: GraphicsCaptureSessionOptions,
     monitor_index: Option<usize>,
     window_name: Option<String>,
     window_hwnd: Option<isize>,
+}
+
+impl NativeWindowsCapture {
+    /// Builds the Rust capture settings shared by synchronous and free-threaded starts.
+    #[inline]
+    fn capture_settings<T>(&self, item: T) -> Settings<PythonCaptureCallbacks, T>
+    where
+        T: TryInto<GraphicsCaptureItemType>,
+    {
+        self.session_options.settings(item, (self.on_frame_arrived_callback.clone(), self.on_closed.clone()))
+    }
 }
 
 #[pymethods]
@@ -200,11 +237,13 @@ impl NativeWindowsCapture {
         Ok(Self {
             on_frame_arrived_callback: Arc::new(on_frame_arrived_callback),
             on_closed: Arc::new(on_closed),
-            cursor_capture,
-            draw_border,
-            secondary_window,
-            minimum_update_interval,
-            dirty_region_settings,
+            session_options: GraphicsCaptureSessionOptions {
+                cursor_capture,
+                draw_border,
+                secondary_window,
+                minimum_update_interval,
+                dirty_region: dirty_region_settings,
+            },
             monitor_index,
             window_name,
             window_hwnd,
@@ -218,16 +257,7 @@ impl NativeWindowsCapture {
             // Capture by window handle (HWND)
             let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
 
-            let settings = Settings::new(
-                window,
-                self.cursor_capture,
-                self.draw_border,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
-                ColorFormat::Bgra8,
-                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
-            );
+            let settings = self.capture_settings(window);
 
             match InnerNativeWindowsCapture::start(settings) {
                 Ok(()) => (),
@@ -246,16 +276,7 @@ impl NativeWindowsCapture {
                 }
             };
 
-            let settings = Settings::new(
-                window,
-                self.cursor_capture,
-                self.draw_border,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
-                ColorFormat::Bgra8,
-                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
-            );
+            let settings = self.capture_settings(window);
 
             match InnerNativeWindowsCapture::start(settings) {
                 Ok(()) => (),
@@ -274,16 +295,7 @@ impl NativeWindowsCapture {
                 }
             };
 
-            let settings = Settings::new(
-                monitor,
-                self.cursor_capture,
-                self.draw_border,
-                self.secondary_window,
-                self.minimum_update_interval,
-                self.dirty_region_settings,
-                ColorFormat::Bgra8,
-                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
-            );
+            let settings = self.capture_settings(monitor);
 
             match InnerNativeWindowsCapture::start(settings) {
                 Ok(()) => (),
@@ -305,16 +317,7 @@ impl NativeWindowsCapture {
             // Capture by window handle (HWND)
             let window = Window::from_raw_hwnd(hwnd as *mut std::ffi::c_void);
 
-            let settings = Settings::new(
-                window,
-                self.cursor_capture,
-                self.draw_border,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
-                ColorFormat::Bgra8,
-                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
-            );
+            let settings = self.capture_settings(window);
 
             let capture_control = match InnerNativeWindowsCapture::start_free_threaded(settings) {
                 Ok(capture_control) => capture_control,
@@ -340,16 +343,7 @@ impl NativeWindowsCapture {
                 }
             };
 
-            let settings = Settings::new(
-                window,
-                self.cursor_capture,
-                self.draw_border,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
-                ColorFormat::Bgra8,
-                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
-            );
+            let settings = self.capture_settings(window);
 
             let capture_control = match InnerNativeWindowsCapture::start_free_threaded(settings) {
                 Ok(capture_control) => capture_control,
@@ -375,16 +369,7 @@ impl NativeWindowsCapture {
                 }
             };
 
-            let settings = Settings::new(
-                monitor,
-                self.cursor_capture,
-                self.draw_border,
-                SecondaryWindowSettings::Default,
-                MinimumUpdateIntervalSettings::Default,
-                DirtyRegionSettings::Default,
-                ColorFormat::Bgra8,
-                (self.on_frame_arrived_callback.clone(), self.on_closed.clone()),
-            );
+            let settings = self.capture_settings(monitor);
 
             let capture_control = match InnerNativeWindowsCapture::start_free_threaded(settings) {
                 Ok(capture_control) => capture_control,
